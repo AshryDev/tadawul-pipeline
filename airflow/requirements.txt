@@ -1,0 +1,12 @@
+dbt-trino==1.7.1
+pyiceberg[glue]==0.6.1
+apache-airflow-providers-trino==5.3.1
+trino==0.328.0
+confluent-kafka==2.3.0
+pandas==2.0.3
+scipy==1.10.1
+pyarrow==14.0.2
+requests==2.31.0
+psycopg2-binary==2.9.9
+pytz==2024.1
+numpy==1.24.4

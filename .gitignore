@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+dbt/target/
+dbt/.user.yml
+dbt/logs/
+logs/
+spark/jars/
+.DS_Store
+*.egg-info/
+airflow/logs/

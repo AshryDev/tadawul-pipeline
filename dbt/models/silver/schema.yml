@@ -1,0 +1,109 @@
+version: 2
+
+models:
+  - name: silver_ticks_cleaned
+    description: >
+      Deduplicated, type-validated intraday tick data. One row per (symbol, event_time).
+      Sourced from bronze_ticks via Spark Structured Streaming.
+    columns:
+      - name: symbol
+        description: "Tadawul stock code."
+        tests:
+          - not_null
+      - name: price
+        description: "Trade price in SAR."
+        tests:
+          - not_null
+      - name: volume
+        description: "Tick volume (shares)."
+        tests:
+          - not_null
+      - name: bid
+        description: "Best bid price in SAR."
+      - name: ask
+        description: "Best ask price in SAR."
+      - name: event_time
+        description: "UTC timestamp of the tick event."
+        tests:
+          - not_null
+      - name: event_date
+        description: "Date derived from event_time (UTC)."
+      - name: session_status
+        description: "Trading session state."
+        tests:
+          - accepted_values:
+              values: ["live", "simulated", "pre-market", "post-market"]
+      - name: ingestion_time
+        description: "When the row was written to Iceberg by Spark."
+      - name: dbt_updated_at
+        description: "When this dbt model last processed this row."
+
+  - name: silver_ohlcv
+    description: >
+      Cleaned and deduplicated daily OHLCV bars for all tracked symbols.
+      Sourced from bronze_daily_ohlcv via the Airflow backfill DAG.
+    columns:
+      - name: symbol
+        description: "Tadawul stock code."
+        tests:
+          - not_null
+      - name: date
+        description: "Trading date."
+        tests:
+          - not_null
+      - name: open
+        description: "Opening price in SAR."
+        tests:
+          - not_null
+      - name: high
+        description: "Daily high price in SAR."
+        tests:
+          - not_null
+      - name: low
+        description: "Daily low price in SAR."
+        tests:
+          - not_null
+      - name: close
+        description: "Closing price in SAR."
+        tests:
+          - not_null
+      - name: volume
+        description: "Total shares traded."
+        tests:
+          - not_null
+      - name: vwap
+        description: "Volume-weighted average price for the session."
+      - name: transactions
+        description: "Number of discrete transactions."
+
+  - name: silver_symbols
+    description: >
+      Static dimension table for the 10 tracked Tadawul stocks.
+      Contains sector classifications and market-cap tier.
+    columns:
+      - name: symbol
+        description: "Tadawul stock code (primary key)."
+        tests:
+          - not_null
+          - unique
+      - name: company_name
+        description: "Full company name."
+        tests:
+          - not_null
+      - name: sector
+        description: "GICS-aligned sector classification."
+        tests:
+          - not_null
+          - accepted_values:
+              values:
+                - Energy
+                - Banking
+                - Petrochemicals
+                - Telecom
+                - Retail
+                - Transportation
+      - name: market_cap_tier
+        description: "Market capitalisation tier."
+        tests:
+          - accepted_values:
+              values: ["Large", "Mid", "Small"]

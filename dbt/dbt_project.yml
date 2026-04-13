@@ -1,0 +1,39 @@
+name: tadawul
+version: "1.0.0"
+config-version: 2
+
+profile: tadawul
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  tadawul:
+    staging:
+      +materialized: view
+      +schema: bronze
+
+    silver:
+      +materialized: incremental
+      +schema: silver
+      +on_schema_change: sync_all_columns
+      +incremental_strategy: append
+
+    gold:
+      +materialized: incremental
+      +schema: gold
+      +on_schema_change: sync_all_columns
+      +incremental_strategy: append
+
+      # Static reference tables
+      silver_symbols:
+        +materialized: table
+
+vars:
+  timezone_display: "Asia/Riyadh"

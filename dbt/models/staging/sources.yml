@@ -1,0 +1,80 @@
+version: 2
+
+sources:
+  - name: bronze
+    description: "Raw append-only bronze tables written by Spark streaming and Airflow batch DAGs."
+    database: iceberg
+    schema: bronze
+
+    tables:
+      - name: bronze_ticks
+        description: >
+          Raw tick data streamed from Kafka via Spark Structured Streaming.
+          Each row represents a single price tick for a Tadawul stock symbol.
+        loaded_at_field: ingestion_time
+        freshness:
+          warn_after:
+            count: 24
+            period: hour
+          error_after:
+            count: 48
+            period: hour
+        columns:
+          - name: symbol
+            description: "Tadawul stock code (e.g. '2222' for Saudi Aramco)."
+            tests:
+              - not_null
+          - name: price
+            description: "Last trade price in SAR."
+            tests:
+              - not_null
+          - name: volume
+            description: "Tick volume."
+          - name: bid
+            description: "Best bid price."
+          - name: ask
+            description: "Best ask price."
+          - name: event_time
+            description: "UTC timestamp of the tick event."
+            tests:
+              - not_null
+          - name: event_date
+            description: "Date partition derived from event_time."
+          - name: session_status
+            description: "live | simulated | pre-market"
+          - name: ingestion_time
+            description: "Wall-clock time when the row was written to Iceberg."
+
+      - name: bronze_daily_ohlcv
+        description: >
+          Daily OHLCV bars fetched from Polygon.io by the Airflow backfill DAG.
+          One row per symbol per trading day.
+        loaded_at_field: ingestion_time
+        freshness:
+          warn_after:
+            count: 25
+            period: hour
+        columns:
+          - name: symbol
+            tests:
+              - not_null
+          - name: date
+            description: "ISO-8601 date string (YYYY-MM-DD)."
+            tests:
+              - not_null
+          - name: open
+            description: "Opening price in SAR."
+          - name: high
+            description: "Daily high price in SAR."
+          - name: low
+            description: "Daily low price in SAR."
+          - name: close
+            description: "Closing price in SAR."
+          - name: volume
+            description: "Total shares traded on this day."
+          - name: vwap
+            description: "Volume-weighted average price."
+          - name: transactions
+            description: "Number of transactions in the session."
+          - name: ingestion_time
+            description: "Wall-clock time when the row was written to Iceberg."

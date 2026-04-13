@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(python:*)",
+      "Bash(docker pull:*)",
+      "Bash(netstat -ano)",
+      "Bash(findstr :5432)",
+      "Bash(findstr \":5432\")",
+      "Bash(netsh interface:*)",
+      "Bash(findstr \"5432\")",
+      "Bash(powershell:*)",
+      "Bash(docker image:*)",
+      "Bash(docker run:*)"
+    ]
+  }
+}
