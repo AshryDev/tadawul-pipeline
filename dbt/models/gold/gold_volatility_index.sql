@@ -1,24 +1,26 @@
 {{
     config(
-        materialized    = 'incremental',
-        unique_key      = ['symbol', 'date'],
-        on_schema_change = 'sync_all_columns',
+        materialized         = 'incremental',
+        unique_key           = ['symbol', 'date'],
+        on_schema_change     = 'sync_all_columns',
         incremental_strategy = 'append',
+        schema               = 'gold',
     )
 }}
 
 /*
   gold_volatility_index
   ──────────────────────
-  Rolling 20-day historical volatility per symbol, annualised.
+  Rolling historical volatility per symbol, annualised.
 
   Methodology:
     1. Compute daily log-return: ln(close_t / close_{t-1})
     2. Compute rolling 20-day standard deviation of log-returns
     3. Annualise: vol_20d × SQRT(252)    [252 trading days/year]
 
-  Also includes the 5-day and 10-day rolling volatility for shorter
-  time-frame comparison.
+  Also includes 5-day and 10-day rolling volatility for shorter
+  time-frame comparison. Used by gold_anomaly_flags and the
+  ml_anomaly_detection Airflow DAG.
 */
 
 WITH
@@ -73,8 +75,8 @@ with_log_return AS (
     FROM with_returns
 
     {% if is_incremental() %}
-    -- Pull extra rows before the incremental cutoff to allow window functions
-    -- to have sufficient look-back data (20 trading days)
+    -- Pull extra rows before the incremental cutoff so window functions
+    -- have sufficient look-back data (20 trading days).
     WHERE date > (
         SELECT DATE_ADD('day', -25, MAX(date)) FROM {{ this }}
     )
@@ -92,19 +94,16 @@ with_volatility AS (
         sector,
         company_name,
         log_return,
-        -- 5-day volatility
         STDDEV(log_return) OVER (
             PARTITION BY symbol
             ORDER BY date
             ROWS BETWEEN 4 PRECEDING AND CURRENT ROW
         ) AS vol_5d,
-        -- 10-day volatility
         STDDEV(log_return) OVER (
             PARTITION BY symbol
             ORDER BY date
             ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
         ) AS vol_10d,
-        -- 20-day volatility (the primary metric)
         STDDEV(log_return) OVER (
             PARTITION BY symbol
             ORDER BY date
@@ -122,19 +121,16 @@ SELECT
     volume,
     high,
     low,
-    ROUND(log_return,                    6)  AS log_return,
-    ROUND(vol_5d,                        6)  AS vol_5d,
-    ROUND(vol_10d,                       6)  AS vol_10d,
-    ROUND(vol_20d,                       6)  AS vol_20d,
-    -- Annualised volatilities (multiply daily vol by √252)
-    ROUND(vol_5d  * SQRT(252),           4)  AS annualized_vol_5d,
-    ROUND(vol_10d * SQRT(252),           4)  AS annualized_vol_10d,
-    ROUND(vol_20d * SQRT(252),           4)  AS annualized_vol,
-    CURRENT_TIMESTAMP                        AS dbt_updated_at
-
+    ROUND(log_return,           6)  AS log_return,
+    ROUND(vol_5d,               6)  AS vol_5d,
+    ROUND(vol_10d,              6)  AS vol_10d,
+    ROUND(vol_20d,              6)  AS vol_20d,
+    ROUND(vol_5d  * SQRT(252),  4)  AS annualized_vol_5d,
+    ROUND(vol_10d * SQRT(252),  4)  AS annualized_vol_10d,
+    ROUND(vol_20d * SQRT(252),  4)  AS annualized_vol,
+    CURRENT_TIMESTAMP               AS dbt_updated_at
 FROM with_volatility
 
 {% if is_incremental() %}
--- Only emit rows for dates after the current max in the table
 WHERE date > (SELECT MAX(date) FROM {{ this }})
 {% endif %}

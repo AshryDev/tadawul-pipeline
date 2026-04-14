@@ -1,9 +1,10 @@
 {{
     config(
-        materialized    = 'incremental',
-        unique_key      = ['symbol', 'date'],
-        on_schema_change = 'sync_all_columns',
+        materialized         = 'incremental',
+        unique_key           = ['symbol', 'date'],
+        on_schema_change     = 'sync_all_columns',
         incremental_strategy = 'append',
+        schema               = 'gold',
     )
 }}
 
@@ -19,8 +20,6 @@
     pct_from_low   — (close - low_52w)  / low_52w   (positive = above low)
     at_52w_high    — true when close is within 2% of the 52-week high
     at_52w_low     — true when close is within 2% of the 52-week low
-
-  This model is used in Superset dashboards to highlight near-breakout symbols.
 */
 
 WITH
@@ -41,7 +40,7 @@ ohlcv AS (
         ON o.symbol = s.symbol
 
     {% if is_incremental() %}
-    -- Pull extra rows to populate the 252-day window for new rows
+    -- Pull extra rows to populate the 252-day window for new rows.
     WHERE o.date > (
         SELECT DATE_ADD('day', -260, MAX(date)) FROM {{ this }}
     )
@@ -60,7 +59,6 @@ with_rolling AS (
         low,
         close,
         volume,
-        -- 52-week (252 trading days) high and low
         MAX(high) OVER (
             PARTITION BY symbol
             ORDER BY date
@@ -85,16 +83,13 @@ SELECT
     low,
     close,
     volume,
-    ROUND(high_52w, 4)                                           AS high_52w,
-    ROUND(low_52w,  4)                                           AS low_52w,
-    -- Proximity percentages (negative means below high; positive means above low)
-    ROUND((close - high_52w) / NULLIF(high_52w, 0), 4)         AS pct_from_high,
-    ROUND((close - low_52w)  / NULLIF(low_52w,  0), 4)         AS pct_from_low,
-    -- Boolean signals
-    ((close - high_52w) / NULLIF(high_52w, 0)) > -0.02         AS at_52w_high,
-    ((close - low_52w)  / NULLIF(low_52w,  0)) <  0.02         AS at_52w_low,
-    CURRENT_TIMESTAMP                                            AS dbt_updated_at
-
+    ROUND(high_52w, 4)                                          AS high_52w,
+    ROUND(low_52w,  4)                                          AS low_52w,
+    ROUND((close - high_52w) / NULLIF(high_52w, 0), 4)        AS pct_from_high,
+    ROUND((close - low_52w)  / NULLIF(low_52w,  0), 4)        AS pct_from_low,
+    ((close - high_52w) / NULLIF(high_52w, 0)) > -0.02        AS at_52w_high,
+    ((close - low_52w)  / NULLIF(low_52w,  0)) <  0.02        AS at_52w_low,
+    CURRENT_TIMESTAMP                                           AS dbt_updated_at
 FROM with_rolling
 
 {% if is_incremental() %}

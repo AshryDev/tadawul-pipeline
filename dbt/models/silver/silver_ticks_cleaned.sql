@@ -1,9 +1,10 @@
 {{
     config(
-        materialized    = 'incremental',
-        unique_key      = ['symbol', 'event_time'],
-        on_schema_change = 'sync_all_columns',
+        materialized         = 'incremental',
+        unique_key           = ['symbol', 'event_time'],
+        on_schema_change     = 'sync_all_columns',
         incremental_strategy = 'append',
+        schema               = 'silver',
     )
 }}
 
@@ -21,21 +22,21 @@ WITH
 source AS (
     SELECT
         symbol,
-        CAST(price  AS DOUBLE)    AS price,
-        CAST(volume AS BIGINT)    AS volume,
-        CAST(bid    AS DOUBLE)    AS bid,
-        CAST(ask    AS DOUBLE)    AS ask,
-        CAST(event_time AS TIMESTAMP) AS event_time,
-        CAST(event_date AS DATE)      AS event_date,
+        CAST(price      AS DOUBLE)      AS price,
+        CAST(volume     AS BIGINT)      AS volume,
+        CAST(bid        AS DOUBLE)      AS bid,
+        CAST(ask        AS DOUBLE)      AS ask,
+        CAST(event_time AS TIMESTAMP)   AS event_time,
+        CAST(event_date AS DATE)        AS event_date,
         session_status,
         ingestion_time
     FROM {{ source('bronze', 'bronze_ticks') }}
     WHERE
-        symbol     IS NOT NULL
-        AND price  IS NOT NULL
-        AND price  > 0
-        AND volume IS NOT NULL
-        AND volume > 0
+        symbol         IS NOT NULL
+        AND price      IS NOT NULL
+        AND price       > 0
+        AND volume     IS NOT NULL
+        AND volume      > 0
         AND event_time IS NOT NULL
 
     {% if is_incremental() %}

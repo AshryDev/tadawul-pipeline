@@ -1,18 +1,18 @@
 """
 Airflow DAG: backfill_ohlcv
 ============================
-Daily batch DAG that fetches daily OHLCV data from Polygon.io for each
-Tadawul symbol and writes it to the Iceberg bronze_daily_ohlcv table on
-AWS S3 via the AWS Glue catalog.
+Daily batch DAG that fetches daily OHLCV data from Yahoo Finance (yfinance)
+for each Tadawul symbol and writes it to the Iceberg bronze_daily_ohlcv table
+on MinIO via the Nessie catalog.
 
 After ingestion, triggers dbt silver + gold model refresh.
 
 Idempotency: Deletes the partition for the execution date before re-writing,
 so re-running for the same date is always safe.
 
-Note: Polygon.io free tier returns ~2 years of historical data. Requests for
-older dates will return empty results; the DAG logs a warning and continues
-rather than failing.
+Note: Yahoo Finance data availability varies by symbol and date. The DAG
+handles missing results gracefully (logs a warning, continues) rather than
+failing. Tadawul symbols are suffixed with .SR (e.g. 2222.SR for Aramco).
 """
 
 from __future__ import annotations
@@ -21,11 +21,12 @@ import logging
 import os
 import subprocess
 import shlex
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
 import pyarrow as pa
-import requests
+import yfinance as yf
 from airflow.decorators import dag, task
 
 log = logging.getLogger(__name__)
@@ -39,7 +40,6 @@ SYMBOLS: list[str] = [
     if s.strip()
 ]
 
-POLYGON_BASE = "https://api.polygon.io/v2/aggs/ticker"
 
 # ── PyArrow schema for bronze_daily_ohlcv ────────────────────────────────────
 BRONZE_OHLCV_SCHEMA = pa.schema(
@@ -58,75 +58,104 @@ BRONZE_OHLCV_SCHEMA = pa.schema(
 )
 
 
-# ── Polygon helpers ───────────────────────────────────────────────────────────
-def _fetch_ohlcv_for_symbol(symbol: str, date_str: str) -> dict | None:
-    """
-    Fetch one day of OHLCV data from Polygon for a Tadawul symbol.
-    Returns a single record dict or None if data is unavailable.
-    """
-    api_key = os.environ["POLYGON_API_KEY"]
-    url = f"{POLYGON_BASE}/X:{symbol}/range/1/day/{date_str}/{date_str}"
-    params = {"adjusted": "true", "sort": "asc", "apiKey": api_key}
+# ── Yahoo Finance helpers ─────────────────────────────────────────────────────
+_RETRY_DELAYS = [60, 120, 300]  # seconds between retries: 1m, 2m, 5m
+_RETRYABLE = ("RateLimit", "Too Many Requests", "TzMissing", "no timezone")
 
-    retry_delay = 2.0
-    while True:
+
+def _fetch_ohlcv_all_symbols(date_str: str) -> list[dict]:
+    """
+    Fetch one day of OHLCV data for ALL symbols in a single yf.download() call.
+
+    This is 10x more API-efficient than one call per symbol: stocks_lakehouse
+    uses the same approach and stays well within Yahoo Finance's rate limits.
+    Retries the entire batch on rate-limit or timezone-missing errors.
+
+    Returns a list of record dicts (one per symbol that has data for date_str).
+    """
+    yf_tickers = [f"{s}.SR" for s in SYMBOLS]
+    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    raw = None
+    for attempt, delay in enumerate(_RETRY_DELAYS + [None], start=1):
         try:
-            resp = requests.get(url, params=params, timeout=15)
-        except requests.RequestException as exc:
-            log.warning("Network error fetching %s on %s: %s", symbol, date_str, exc)
-            return None
+            raw = yf.download(
+                tickers=yf_tickers,
+                start=date_str,
+                end=next_day,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=False,  # sequential within the call — avoids burst spikes
+            )
+            break
+        except Exception as exc:
+            exc_str = str(exc)
+            if any(tag in exc_str for tag in _RETRYABLE):
+                if delay is None:
+                    log.warning("Rate limited after %d attempts — skipping %s.", attempt, date_str)
+                    return []
+                log.warning("Rate limited (attempt %d) — retrying in %ds.", attempt, delay)
+                time.sleep(delay)
+            else:
+                log.warning("yfinance error for %s: %s", date_str, exc)
+                return []
 
-        if resp.status_code == 200:
-            results = resp.json().get("results", [])
-            if not results:
-                log.warning(
-                    "No data from Polygon for %s on %s (free-tier limit or market closed).",
-                    symbol,
-                    date_str,
-                )
-                return None
-            bar = results[0]
-            return {
+    if raw is None or raw.empty:
+        log.warning("No data from Yahoo Finance for %s (market closed or holiday).", date_str)
+        return []
+
+    ingestion_time = datetime.utcnow()
+    records: list[dict] = []
+
+    for symbol, yf_ticker in zip(SYMBOLS, yf_tickers):
+        try:
+            # With group_by='ticker' and multiple tickers, columns are MultiIndex:
+            # level-0 = ticker, level-1 = field (Open/High/Low/Close/Volume)
+            sym_df = raw[yf_ticker] if len(yf_tickers) > 1 else raw
+            if sym_df.empty:
+                log.warning("No data for %s on %s.", yf_ticker, date_str)
+                continue
+            row = sym_df.iloc[0]
+            open_ = float(row["Open"])
+            high  = float(row["High"])
+            low   = float(row["Low"])
+            close = float(row["Close"])
+            records.append({
                 "symbol": symbol,
                 "date": date_str,
-                "open": float(bar.get("o", 0.0)),
-                "high": float(bar.get("h", 0.0)),
-                "low": float(bar.get("l", 0.0)),
-                "close": float(bar.get("c", 0.0)),
-                "volume": int(bar.get("v", 0)),
-                "vwap": float(bar.get("vw", 0.0)),
-                "transactions": int(bar.get("n", 0)),
-                "ingestion_time": datetime.utcnow(),
-            }
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": int(row["Volume"]),
+                "vwap": round((open_ + high + low + close) / 4, 4),
+                "transactions": 0,
+                "ingestion_time": ingestion_time,
+            })
+        except Exception as exc:
+            log.warning("Error parsing data for %s on %s: %s", symbol, date_str, exc)
 
-        if resp.status_code == 429:
-            log.warning("Rate-limited by Polygon. Retrying in %.1fs …", retry_delay)
-            import time
-            time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2.0, 60.0)
-            continue
-
-        log.warning(
-            "Polygon returned %d for %s on %s — skipping.",
-            resp.status_code,
-            symbol,
-            date_str,
-        )
-        return None
+    return records
 
 
 # ── PyIceberg catalog helper ──────────────────────────────────────────────────
 def _get_catalog():
-    """Return a PyIceberg GlueCatalog instance using env-var credentials."""
-    from pyiceberg.catalog.glue import GlueCatalog
+    """Return a PyIceberg REST catalog pointed at Nessie + MinIO."""
+    from pyiceberg.catalog import load_catalog
 
-    return GlueCatalog(
-        name="glue",
+    return load_catalog(
+        "nessie",
         **{
-            "region_name": os.environ["AWS_REGION"],
-            "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
-            "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
-            "warehouse": f"s3://{os.environ['S3_BUCKET_NAME']}/warehouse",
+            "type": "rest",
+            "uri": os.environ.get("NESSIE_URI", "http://nessie:19120/iceberg/"),
+            "warehouse": os.environ.get("MINIO_WAREHOUSE", "s3a://stocks/"),
+            "s3.endpoint": os.environ.get("MINIO_ENDPOINT", "http://minio:9000"),
+            "s3.access-key-id": os.environ.get("MINIO_ACCESS_KEY", "admin"),
+            "s3.secret-access-key": os.environ.get("MINIO_SECRET_KEY", "password"),
+            "s3.path-style-access": "true",
+            "s3.region": os.environ.get("MINIO_REGION", "eu-south-1"),
         },
     )
 
@@ -183,39 +212,41 @@ def _ensure_bronze_ohlcv_table(catalog) -> Any:
 # ── DAG definition ────────────────────────────────────────────────────────────
 @dag(
     dag_id="backfill_ohlcv",
-    description="Daily OHLCV ingestion from Polygon.io → Iceberg bronze_daily_ohlcv → dbt silver/gold",
+    description="Daily OHLCV ingestion from Yahoo Finance → Iceberg bronze_daily_ohlcv (MinIO/Nessie) → dbt silver/gold",
     schedule="@daily",
-    start_date=datetime(2021, 1, 1),
+    start_date=datetime(2021, 4, 14), 
     catchup=True,
-    max_active_runs=3,
+    max_active_runs=1,
     default_args={
         "owner": "data-engineering",
         "retries": 2,
         "retry_delay": timedelta(minutes=5),
         "email_on_failure": False,
     },
-    tags=["tadawul", "bronze", "batch", "polygon"],
+    tags=["tadawul", "bronze", "batch", "yfinance"],
 )
 def backfill_ohlcv_dag():
 
     @task()
     def fetch_ohlcv(execution_date=None) -> list[dict]:
-        """Fetch OHLCV for all symbols for the DAG execution date."""
-        # execution_date is the start of the schedule interval (previous day)
-        date_str = (execution_date + timedelta(days=0)).strftime("%Y-%m-%d")
-        log.info("Fetching OHLCV for date %s across %d symbols.", date_str, len(SYMBOLS))
+        """
+        Fetch OHLCV for all symbols for the DAG execution date.
 
-        records: list[dict] = []
-        for symbol in SYMBOLS:
-            record = _fetch_ohlcv_for_symbol(symbol, date_str)
-            if record:
-                records.append(record)
+        Uses a single bulk yf.download() call for all symbols so each DAG run
+        makes only 1 API request instead of 10 (one per symbol). This keeps the
+        request rate ~10x lower than the previous per-symbol approach, matching
+        the stocks_lakehouse strategy that avoids rate limiting.
+        """
+        date_str = execution_date.strftime("%Y-%m-%d")
+        log.info("Fetching OHLCV for date %s (bulk, %d symbols).", date_str, len(SYMBOLS))
+
+        records = _fetch_ohlcv_all_symbols(date_str)
 
         log.info("Fetched %d records for %s.", len(records), date_str)
         return records
 
     @task()
-    def write_bronze(records: list[dict], execution_date=None) -> None:
+    def write_bronze(records: list[dict], execution_date=None) -> None:  # type: ignore[return]
         """
         Write records to Iceberg bronze_daily_ohlcv.
 
@@ -248,45 +279,57 @@ def backfill_ohlcv_dag():
         log.info("Successfully appended %d rows to bronze_daily_ohlcv.", len(records))
 
     @task()
-    def run_dbt() -> None:
+    def run_dbt(_upstream: None = None) -> None:
         """
         Run dbt silver and gold models.
 
         Invokes dbt as a subprocess so it runs in the same Python environment
         where dbt-trino is installed (inside the Airflow container).
+
+        _upstream is a dummy parameter that carries the write_bronze XCom so
+        Airflow creates an explicit task dependency (run_dbt waits for
+        write_bronze to succeed before it starts).
+
+        --log-path /tmp/dbt-logs redirects dbt's rotating log file out of the
+        host-mounted ./dbt volume, which the airflow user (uid 50000) cannot
+        write to.
         """
-        cmd = (
-            "dbt run "
-            "--select silver+ gold+ "
+        dbt_flags = (
             "--profiles-dir /opt/airflow/dbt "
-            "--project-dir /opt/airflow/dbt"
-        )
-        log.info("Running: %s", cmd)
-
-        result = subprocess.run(
-            shlex.split(cmd),
-            capture_output=True,
-            text=True,
-            cwd="/opt/airflow/dbt",
+            "--project-dir /opt/airflow/dbt "
+            "--log-path /tmp/dbt-logs"
         )
 
-        if result.stdout:
-            log.info("dbt stdout:\n%s", result.stdout)
-        if result.stderr:
-            log.warning("dbt stderr:\n%s", result.stderr)
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"dbt run failed with exit code {result.returncode}.\n"
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        for label, cmd in [
+            ("dbt deps", f"dbt deps {dbt_flags}"),
+            # Exclude tick-dependent models (silver_ticks_cleaned,
+            # gold_intraday_vwap) — those require bronze_ticks which is
+            # written by the Spark streaming consumer, not this batch DAG.
+            ("dbt run",  f"dbt run --select silver_ohlcv+ silver_symbols {dbt_flags}"),
+        ]:
+            log.info("Running: %s", cmd)
+            result = subprocess.run(
+                shlex.split(cmd),
+                capture_output=True,
+                text=True,
+                cwd="/opt/airflow/dbt",
             )
+            if result.stdout:
+                log.info("%s stdout:\n%s", label, result.stdout)
+            if result.stderr:
+                log.warning("%s stderr:\n%s", label, result.stderr)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"{label} failed with exit code {result.returncode}.\n"
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+                )
 
         log.info("dbt run completed successfully.")
 
     # ── Task dependencies ─────────────────────────────────────────────────────
     records = fetch_ohlcv()
-    write_bronze(records)
-    run_dbt()
+    bronze_done = write_bronze(records)
+    run_dbt(bronze_done)
 
 
 backfill_ohlcv_dag()

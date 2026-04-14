@@ -3,20 +3,21 @@ Tadawul Spark Structured Streaming Consumer
 ============================================
 Reads raw tick data from the Kafka topic `tadawul.ticks`, applies schema
 validation and watermarking, then writes micro-batches to the Iceberg
-bronze_ticks table on AWS S3 via the AWS Glue catalog.
+bronze_ticks table on MinIO via the Nessie catalog.
 
 Run inside the Spark container:
     spark-submit \
         --master spark://spark-master:7077 \
-        --jars /opt/bitnami/spark/jars/extra/iceberg-spark-runtime-3.5_2.12-1.4.3.jar,\
-/opt/bitnami/spark/jars/extra/iceberg-aws-bundle-1.4.3.jar \
+        --jars /opt/spark/jars/extra/iceberg-spark-runtime-3.5_2.12-1.4.3.jar,\
+/opt/spark/jars/extra/iceberg-aws-bundle-1.4.3.jar \
         /opt/spark-app/streaming_consumer.py
 
-Required environment variables:
-    AWS_ACCESS_KEY_ID
-    AWS_SECRET_ACCESS_KEY
-    AWS_REGION
-    S3_BUCKET_NAME
+Environment variables (all have sensible defaults for the Docker Compose setup):
+    MINIO_ENDPOINT            (default: http://minio:9000)
+    MINIO_ACCESS_KEY          (default: admin)
+    MINIO_SECRET_KEY          (default: password)
+    MINIO_REGION              (default: eu-south-1)
+    NESSIE_URI                (default: http://nessie:19120/iceberg/)
     KAFKA_BOOTSTRAP_SERVERS   (default: kafka:29092)
 """
 
@@ -52,17 +53,18 @@ logging.basicConfig(
 log = logging.getLogger("tadawul.spark.consumer")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-AWS_ACCESS_KEY_ID: str = os.environ["AWS_ACCESS_KEY_ID"]
-AWS_SECRET_ACCESS_KEY: str = os.environ["AWS_SECRET_ACCESS_KEY"]
-AWS_REGION: str = os.environ.get("AWS_REGION", "me-south-1")
-S3_BUCKET: str = os.environ["S3_BUCKET_NAME"]
+MINIO_ENDPOINT: str = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
+MINIO_ACCESS_KEY: str = os.environ.get("MINIO_ACCESS_KEY", "admin")
+MINIO_SECRET_KEY: str = os.environ.get("MINIO_SECRET_KEY", "password")
+MINIO_REGION: str = os.environ.get("MINIO_REGION", "eu-south-1")
+NESSIE_URI: str = os.environ.get("NESSIE_URI", "http://nessie:19120/iceberg/")
 KAFKA_BOOTSTRAP_SERVERS: str = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 KAFKA_TOPIC: str = os.environ.get("KAFKA_TOPIC_TICKS", "tadawul.ticks")
 CHECKPOINT_DIR: str = "/tmp/spark-checkpoints/bronze_ticks"
 TRIGGER_INTERVAL: str = "10 seconds"
 WATERMARK_DELAY: str = "10 seconds"
 
-WAREHOUSE_PATH: str = f"s3://{S3_BUCKET}/warehouse"
+WAREHOUSE_PATH: str = "s3a://stocks/"
 
 # ── Tick schema (matches producer output) ─────────────────────────────────────
 TICK_SCHEMA = StructType(
@@ -80,7 +82,7 @@ TICK_SCHEMA = StructType(
 
 # ── Iceberg table DDL ─────────────────────────────────────────────────────────
 CREATE_BRONZE_TICKS_SQL = """
-    CREATE TABLE IF NOT EXISTS glue_catalog.bronze.bronze_ticks (
+    CREATE TABLE IF NOT EXISTS nessie.bronze.bronze_ticks (
         symbol         STRING        COMMENT 'Tadawul stock code (e.g. 2222)',
         price          DOUBLE        COMMENT 'Last trade price in SAR',
         volume         BIGINT        COMMENT 'Volume for the tick period',
@@ -110,42 +112,34 @@ def build_spark_session() -> SparkSession:
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
-        # Glue catalog registration
+        # ── Nessie REST catalog ───────────────────────────────────────────────
+        .config("spark.sql.catalog.nessie", "org.apache.iceberg.spark.SparkCatalog")
         .config(
-            "spark.sql.catalog.glue_catalog",
-            "org.apache.iceberg.spark.SparkCatalog",
+            "spark.sql.catalog.nessie.catalog-impl",
+            "org.apache.iceberg.rest.RESTCatalog",
         )
+        .config("spark.sql.catalog.nessie.uri", NESSIE_URI)
+        .config("spark.sql.catalog.nessie.warehouse", WAREHOUSE_PATH)
         .config(
-            "spark.sql.catalog.glue_catalog.catalog-impl",
-            "org.apache.iceberg.aws.glue.GlueCatalog",
-        )
-        .config("spark.sql.catalog.glue_catalog.warehouse", WAREHOUSE_PATH)
-        .config(
-            "spark.sql.catalog.glue_catalog.io-impl",
+            "spark.sql.catalog.nessie.io-impl",
             "org.apache.iceberg.aws.s3.S3FileIO",
         )
-        # ── Iceberg S3FileIO credentials (AWS SDK v2 path) ────────────────────
-        .config(
-            "spark.sql.catalog.glue_catalog.s3.access-key-id",
-            AWS_ACCESS_KEY_ID,
-        )
-        .config(
-            "spark.sql.catalog.glue_catalog.s3.secret-access-key",
-            AWS_SECRET_ACCESS_KEY,
-        )
-        .config("spark.sql.catalog.glue_catalog.s3.region", AWS_REGION)
-        # ── Hadoop S3A credentials (for checkpoint writes via hadoop-aws) ──────
-        # Both credential sets must be configured independently; one does not
-        # satisfy the other.
-        .config("spark.hadoop.fs.s3a.access.key", AWS_ACCESS_KEY_ID)
-        .config("spark.hadoop.fs.s3a.secret.key", AWS_SECRET_ACCESS_KEY)
-        .config("spark.hadoop.fs.s3a.endpoint.region", AWS_REGION)
+        # ── Iceberg S3FileIO → MinIO ──────────────────────────────────────────
+        .config("spark.sql.catalog.nessie.s3.endpoint", MINIO_ENDPOINT)
+        .config("spark.sql.catalog.nessie.s3.access-key-id", MINIO_ACCESS_KEY)
+        .config("spark.sql.catalog.nessie.s3.secret-access-key", MINIO_SECRET_KEY)
+        .config("spark.sql.catalog.nessie.s3.path-style-access", "true")
+        .config("spark.sql.catalog.nessie.s3.region", MINIO_REGION)
+        # ── Hadoop S3A → MinIO (for checkpoint writes) ────────────────────────
+        # Must be configured independently from Iceberg S3FileIO.
+        .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
+        .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
+        .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
         .config(
             "spark.hadoop.fs.s3a.impl",
             "org.apache.hadoop.fs.s3a.S3AFileSystem",
         )
-        # Iceberg Glue region
-        .config("spark.sql.catalog.glue_catalog.glue.region", AWS_REGION)
         # Serialization
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .getOrCreate()
@@ -167,9 +161,9 @@ def write_to_bronze(batch_df, batch_id: int) -> None:
 
     log.info("Writing batch %d (%d rows) to bronze_ticks …", batch_id, batch_df.count())
 
-    # Ensure the Glue database exists
+    # Ensure the namespace exists
     batch_df.sparkSession.sql(
-        "CREATE DATABASE IF NOT EXISTS glue_catalog.bronze"
+        "CREATE NAMESPACE IF NOT EXISTS nessie.bronze"
     )
 
     # Idempotent table creation
@@ -179,7 +173,7 @@ def write_to_bronze(batch_df, batch_id: int) -> None:
     (
         batch_df.withColumn("ingestion_time", current_timestamp())
         .drop("timestamp")
-        .writeTo("glue_catalog.bronze.bronze_ticks")
+        .writeTo("nessie.bronze.bronze_ticks")
         .option("mergeSchema", "true")
         .append()
     )

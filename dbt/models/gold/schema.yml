@@ -7,17 +7,12 @@ models:
       with sector metadata. Derived from silver_ticks_cleaned.
     columns:
       - name: symbol
-        description: "Tadawul stock code."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: session_date
-        description: "Trading session date."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: vwap
         description: "Volume-weighted average price for the session in SAR."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: session_open
         description: "First traded price of the session."
       - name: session_high
@@ -32,8 +27,7 @@ models:
         description: "Number of tick records contributing to this session."
       - name: sector
         description: "Sector classification from silver_symbols."
-        tests:
-          - not_null
+        tests: [not_null]
 
   - name: gold_sector_performance
     description: >
@@ -41,25 +35,13 @@ models:
       within each sector to measure relative sector strength.
     columns:
       - name: sector
-        description: "GICS-aligned sector name."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: date
-        description: "Trading date."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: symbol_count
-        description: "Number of symbols with data in this sector on this date."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: avg_daily_return
         description: "Average daily return across all sector symbols."
-      - name: max_daily_return
-        description: "Best-performing symbol return in the sector."
-      - name: min_daily_return
-        description: "Worst-performing symbol return in the sector."
-      - name: stddev_daily_return
-        description: "Dispersion of returns within the sector."
       - name: advance_ratio
         description: "Fraction of symbols with positive return (0–1)."
       - name: total_sector_volume
@@ -68,16 +50,12 @@ models:
   - name: gold_volatility_index
     description: >
       Rolling historical volatility per symbol at multiple time horizons.
-      Used by the ML anomaly detection DAG and Superset dashboards.
+      Used by the ml_anomaly_detection Airflow DAG and dashboards.
     columns:
       - name: symbol
-        description: "Tadawul stock code."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: date
-        description: "Trading date."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: log_return
         description: "Daily log-return: ln(close_t / close_{t-1})."
       - name: vol_5d
@@ -89,9 +67,7 @@ models:
       - name: annualized_vol
         description: "Annualised 20-day volatility (vol_20d × √252)."
       - name: volume
-        description: "Daily share volume (used by anomaly DAG for Z-score)."
-        tests:
-          - not_null
+        tests: [not_null]
 
   - name: gold_anomaly_flags
     description: >
@@ -100,15 +76,10 @@ models:
       records from the ml_anomaly_detection Airflow DAG.
     columns:
       - name: symbol
-        description: "Tadawul stock code."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: date
-        description: "Date of the anomalous event."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: anomaly_type
-        description: "Algorithm that generated this flag."
         tests:
           - not_null
           - accepted_values:
@@ -118,33 +89,25 @@ models:
       - name: threshold
         description: "Threshold value used for the is_anomaly flag."
       - name: is_anomaly
-        description: "True when the score exceeds the threshold."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: detected_at
         description: "Timestamp when the anomaly was detected."
 
   - name: gold_52w_levels
     description: >
       52-week high/low proximity analysis. Highlights near-breakout or
-      near-breakdown symbols for Superset dashboards and Grafana panels.
+      near-breakdown symbols for dashboards.
     columns:
       - name: symbol
-        description: "Tadawul stock code."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: date
-        description: "Trading date."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: high_52w
         description: "Rolling 52-week (252-day) high of the daily high price."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: low_52w
         description: "Rolling 52-week (252-day) low of the daily low price."
-        tests:
-          - not_null
+        tests: [not_null]
       - name: pct_from_high
         description: "Percentage distance of close from 52-week high (negative = below)."
       - name: pct_from_low

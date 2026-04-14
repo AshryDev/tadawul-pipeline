@@ -11,7 +11,16 @@
       "Bash(findstr \"5432\")",
       "Bash(powershell:*)",
       "Bash(docker image:*)",
-      "Bash(docker run:*)"
+      "Bash(docker run:*)",
+      "Bash(xargs cat:*)",
+      "Bash(docker exec airflow-scheduler:*)",
+      "Bash(rm /d/Code/tadawul-pipeline/dbt/seeds/city_codes.csv /d/Code/tadawul-pipeline/dbt/seeds/city_codess.xlsx /d/Code/tadawul-pipeline/dbt/seeds/vip_customers.csv /d/Code/tadawul-pipeline/dbt/dbt_seed.txt)",
+      "Bash(rm -rf /d/Code/tadawul-pipeline/dbt/dbt-data)",
+      "Bash(rm -f /d/Code/tadawul-pipeline/dbt/logs/dbt.log)",
+      "Bash(docker exec minio:*)",
+      "Bash(docker exec:*)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); fi=d.get\\('failureInfo',{}\\); print\\(fi.get\\('message',''\\)\\); [print\\(c.get\\('message',''\\)\\) for c in fi.get\\('suppressed',[]\\)]\")",
+      "Bash(python3 -c \"import json,sys; c=json.load\\(sys.stdin\\); a=c.get\\('aliases',{}\\).get\\('local',{}\\); print\\('url:',a.get\\('url'\\)\\); print\\('access_key:',a.get\\('accessKey'\\)\\)\")"
     ]
   }
 }

@@ -47,7 +47,7 @@ sources:
 
       - name: bronze_daily_ohlcv
         description: >
-          Daily OHLCV bars fetched from Polygon.io by the Airflow backfill DAG.
+          Daily OHLCV bars fetched from Yahoo Finance by the Airflow backfill DAG.
           One row per symbol per trading day.
         loaded_at_field: ingestion_time
         freshness:

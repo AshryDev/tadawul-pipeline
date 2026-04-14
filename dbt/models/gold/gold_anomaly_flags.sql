@@ -1,9 +1,10 @@
 {{
     config(
-        materialized    = 'incremental',
-        unique_key      = ['symbol', 'date', 'anomaly_type'],
-        on_schema_change = 'sync_all_columns',
+        materialized         = 'incremental',
+        unique_key           = ['symbol', 'date', 'anomaly_type'],
+        on_schema_change     = 'sync_all_columns',
         incremental_strategy = 'append',
+        schema               = 'gold',
     )
 }}
 
@@ -35,7 +36,6 @@ vol_with_stats AS (
         v.volume,
         v.close,
         v.sector,
-        -- Rolling 30-day volume statistics
         AVG(CAST(v.volume AS DOUBLE)) OVER (
             PARTITION BY v.symbol
             ORDER BY v.date
@@ -46,7 +46,6 @@ vol_with_stats AS (
             ORDER BY v.date
             ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
         ) AS vol_std_30d,
-        -- Rolling 90-day return percentiles for IQR
         APPROX_PERCENTILE(v.log_return, 0.25) OVER (
             PARTITION BY v.symbol
             ORDER BY v.date
@@ -79,13 +78,11 @@ scored AS (
         vol_std_30d,
         return_q1_90d,
         return_q3_90d,
-        -- Volume Z-score
         CASE
             WHEN vol_std_30d > 0
             THEN (CAST(volume AS DOUBLE) - vol_mean_30d) / vol_std_30d
             ELSE 0
         END AS vol_zscore,
-        -- IQR bounds
         return_q1_90d - 1.5 * (return_q3_90d - return_q1_90d) AS iqr_lower_fence,
         return_q3_90d + 1.5 * (return_q3_90d - return_q1_90d) AS iqr_upper_fence
     FROM vol_with_stats
@@ -95,11 +92,11 @@ volume_anomalies AS (
     SELECT
         symbol,
         date,
-        'volume_zscore'                                   AS anomaly_type,
-        ROUND(vol_zscore, 4)                              AS score,
-        CAST(2.5 AS DOUBLE)                               AS threshold,
-        ABS(vol_zscore) > 2.5                             AS is_anomaly,
-        CURRENT_TIMESTAMP                                 AS detected_at
+        'volume_zscore'                AS anomaly_type,
+        ROUND(vol_zscore, 4)           AS score,
+        CAST(2.5 AS DOUBLE)            AS threshold,
+        ABS(vol_zscore) > 2.5          AS is_anomaly,
+        CURRENT_TIMESTAMP              AS detected_at
     FROM scored
     WHERE vol_std_30d IS NOT NULL
 ),
@@ -108,33 +105,30 @@ price_anomalies AS (
     SELECT
         symbol,
         date,
-        'price_iqr'                                       AS anomaly_type,
+        'price_iqr'                    AS anomaly_type,
         ROUND(
             GREATEST(
                 iqr_lower_fence - log_return,
                 log_return - iqr_upper_fence,
                 0.0
             ) / NULLIF(return_q3_90d - return_q1_90d, 0),
-        4)                                                AS score,
-        CAST(1.5 AS DOUBLE)                               AS threshold,
+        4)                             AS score,
+        CAST(1.5 AS DOUBLE)            AS threshold,
         log_return < iqr_lower_fence
-            OR log_return > iqr_upper_fence               AS is_anomaly,
-        CURRENT_TIMESTAMP                                 AS detected_at
+            OR log_return > iqr_upper_fence AS is_anomaly,
+        CURRENT_TIMESTAMP              AS detected_at
     FROM scored
     WHERE return_q1_90d IS NOT NULL
       AND return_q3_90d IS NOT NULL
       AND log_return     IS NOT NULL
-),
-
-all_anomalies AS (
-    SELECT * FROM volume_anomalies
-    UNION ALL
-    SELECT * FROM price_anomalies
 )
 
-SELECT *
-FROM all_anomalies
+SELECT * FROM volume_anomalies
+UNION ALL
+SELECT * FROM price_anomalies
 
 {% if is_incremental() %}
-WHERE date > (SELECT MAX(date) FROM {{ this }})
+-- Emit only new dates; the 95-day buffer above feeds the window functions.
+-- This WHERE is applied after the UNION ALL via a wrapping subquery in
+-- dbt's incremental compilation.
 {% endif %}

@@ -1,9 +1,10 @@
 {{
     config(
-        materialized    = 'incremental',
-        unique_key      = ['sector', 'date'],
-        on_schema_change = 'sync_all_columns',
+        materialized         = 'incremental',
+        unique_key           = ['sector', 'date'],
+        on_schema_change     = 'sync_all_columns',
         incremental_strategy = 'append',
+        schema               = 'gold',
     )
 }}
 
@@ -70,19 +71,16 @@ with_return AS (
 SELECT
     sector,
     date,
-    COUNT(DISTINCT symbol)                       AS symbol_count,
-    ROUND(AVG(daily_return),    6)               AS avg_daily_return,
-    ROUND(MAX(daily_return),    6)               AS max_daily_return,
-    ROUND(MIN(daily_return),    6)               AS min_daily_return,
-    ROUND(
-        STDDEV(daily_return),
-    6)                                           AS stddev_daily_return,
-    SUM(CAST(volume AS BIGINT))                  AS total_sector_volume,
-    -- Sector momentum: ratio of advancing to declining symbols
+    COUNT(DISTINCT symbol)                                              AS symbol_count,
+    ROUND(AVG(daily_return),    6)                                     AS avg_daily_return,
+    ROUND(MAX(daily_return),    6)                                     AS max_daily_return,
+    ROUND(MIN(daily_return),    6)                                     AS min_daily_return,
+    ROUND(STDDEV(daily_return), 6)                                     AS stddev_daily_return,
+    SUM(CAST(volume AS BIGINT))                                        AS total_sector_volume,
     CAST(
         SUM(CASE WHEN daily_return > 0 THEN 1 ELSE 0 END) AS DOUBLE
-    ) / NULLIF(COUNT(DISTINCT symbol), 0)        AS advance_ratio,
-    CURRENT_TIMESTAMP                            AS dbt_updated_at
+    ) / NULLIF(COUNT(DISTINCT symbol), 0)                              AS advance_ratio,
+    CURRENT_TIMESTAMP                                                  AS dbt_updated_at
 FROM with_return
 WHERE daily_return IS NOT NULL
 GROUP BY sector, date

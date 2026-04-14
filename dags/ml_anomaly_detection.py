@@ -2,9 +2,8 @@
 Airflow DAG: ml_anomaly_detection
 ===================================
 Daily ML pipeline that reads gold-layer metrics from Trino, runs two
-anomaly detection algorithms in Python, then writes results to:
-  1. Iceberg gold_anomaly_flags table (for Trino / Superset queries)
-  2. PostgreSQL ml_anomalies table (for Grafana alerting panels)
+anomaly detection algorithms in Python, then writes results to the
+Iceberg gold_anomaly_flags table (queryable via Trino).
 
 Algorithms:
   - Volume Z-score: flag when (volume - 30d_mean) / 30d_std > 2.5
@@ -24,7 +23,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import psycopg2
 import trino
 from airflow.decorators import dag, task
 
@@ -60,15 +58,19 @@ def _get_trino_conn():
 
 # ── PyIceberg catalog ─────────────────────────────────────────────────────────
 def _get_catalog():
-    from pyiceberg.catalog.glue import GlueCatalog
+    from pyiceberg.catalog import load_catalog
 
-    return GlueCatalog(
-        name="glue",
+    return load_catalog(
+        "nessie",
         **{
-            "region_name": os.environ["AWS_REGION"],
-            "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
-            "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
-            "warehouse": f"s3://{os.environ['S3_BUCKET_NAME']}/warehouse",
+            "type": "rest",
+            "uri": os.environ.get("NESSIE_URI", "http://nessie:19120/iceberg/"),
+            "warehouse": os.environ.get("MINIO_WAREHOUSE", "s3a://stocks/"),
+            "s3.endpoint": os.environ.get("MINIO_ENDPOINT", "http://minio:9000"),
+            "s3.access-key-id": os.environ.get("MINIO_ACCESS_KEY", "admin"),
+            "s3.secret-access-key": os.environ.get("MINIO_SECRET_KEY", "password"),
+            "s3.path-style-access": "true",
+            "s3.region": os.environ.get("MINIO_REGION", "eu-south-1"),
         },
     )
 
@@ -119,43 +121,10 @@ def _ensure_anomaly_flags_table(catalog) -> Any:
     )
 
 
-# ── PostgreSQL setup ──────────────────────────────────────────────────────────
-def _get_pg_conn():
-    return psycopg2.connect(
-        host=os.environ.get("POSTGRES_HOST", "postgres"),
-        port=int(os.environ.get("POSTGRES_PORT", 5432)),
-        user=os.environ.get("POSTGRES_USER", "airflow"),
-        password=os.environ.get("POSTGRES_PASSWORD", "airflow"),
-        dbname=os.environ.get("POSTGRES_DB", "airflow"),
-    )
-
-
-def _ensure_pg_table(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS ml_anomalies (
-                id            SERIAL PRIMARY KEY,
-                symbol        TEXT        NOT NULL,
-                date          DATE        NOT NULL,
-                anomaly_type  TEXT        NOT NULL,
-                score         DOUBLE PRECISION,
-                threshold     DOUBLE PRECISION,
-                is_anomaly    BOOLEAN     NOT NULL DEFAULT FALSE,
-                detected_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-        cur.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ml_anomalies_symbol_date ON ml_anomalies (symbol, date)"
-        )
-    conn.commit()
-
-
 # ── DAG tasks ─────────────────────────────────────────────────────────────────
 @dag(
     dag_id="ml_anomaly_detection",
-    description="Daily anomaly detection on gold-layer metrics → Iceberg + PostgreSQL",
+    description="Daily anomaly detection on gold-layer metrics → Iceberg",
     schedule="@daily",
     start_date=datetime(2021, 1, 1),
     catchup=True,
@@ -360,54 +329,10 @@ def ml_anomaly_detection_dag():
 
         log.info("Wrote %d anomaly records to gold_anomaly_flags.", len(anomalies))
 
-    @task()
-    def write_postgresql(anomalies: list[dict]) -> None:
-        """
-        Upsert anomaly records to PostgreSQL ml_anomalies table.
-        This table powers Grafana alerting panels.
-        """
-        if not anomalies:
-            log.info("No anomalies to write to PostgreSQL.")
-            return
-
-        conn = _get_pg_conn()
-        _ensure_pg_table(conn)
-
-        date_str = anomalies[0]["date"]
-
-        with conn.cursor() as cur:
-            # Delete existing rows for this date (idempotency)
-            cur.execute(
-                "DELETE FROM ml_anomalies WHERE date = %s",
-                (date_str,),
-            )
-
-            cur.executemany(
-                """
-                INSERT INTO ml_anomalies
-                    (symbol, date, anomaly_type, score, threshold, is_anomaly, detected_at)
-                VALUES
-                    (%(symbol)s, %(date)s, %(anomaly_type)s, %(score)s, %(threshold)s,
-                     %(is_anomaly)s, %(detected_at)s)
-                """,
-                anomalies,
-            )
-
-        conn.commit()
-        conn.close()
-
-        flagged = sum(1 for a in anomalies if a["is_anomaly"])
-        log.info(
-            "Wrote %d rows to ml_anomalies in PostgreSQL (%d flagged).",
-            len(anomalies),
-            flagged,
-        )
-
     # ── Task dependencies ─────────────────────────────────────────────────────
     gold_data = read_gold_data()
     anomalies = compute_anomalies(gold_data)
     write_anomaly_flags(anomalies)
-    write_postgresql(anomalies)
 
 
 ml_anomaly_detection_dag()

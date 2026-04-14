@@ -1,15 +1,24 @@
-tadawul:
+lakehouse:
   target: dev
   outputs:
     dev:
       type: trino
       method: none
-      host: "{{ env_var('TRINO_HOST', 'localhost') }}"
+      user: "{{ env_var('TRINO_USER', 'iceberg') }}"
+      host: "{{ env_var('TRINO_HOST', 'trino') }}"
       port: "{{ env_var('TRINO_PORT', '8080') | int }}"
-      database: iceberg
+      catalog: iceberg
       schema: silver
       threads: 4
-      http_scheme: http
       session_properties:
         query_max_run_time: "2h"
-        task_writer_count: "4"
+
+    dev_local:
+      type: trino
+      method: none
+      user: "{{ env_var('TRINO_USER', 'iceberg') }}"
+      host: localhost
+      port: 8080
+      catalog: iceberg
+      schema: silver
+      threads: 4

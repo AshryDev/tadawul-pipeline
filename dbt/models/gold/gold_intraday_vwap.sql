@@ -1,9 +1,10 @@
 {{
     config(
-        materialized    = 'incremental',
-        unique_key      = ['symbol', 'session_date'],
-        on_schema_change = 'sync_all_columns',
+        materialized         = 'incremental',
+        unique_key           = ['symbol', 'session_date'],
+        on_schema_change     = 'sync_all_columns',
         incremental_strategy = 'append',
+        schema               = 'gold',
     )
 }}
 
@@ -51,18 +52,14 @@ session_agg AS (
             / NULLIF(SUM(CAST(volume AS DOUBLE)), 0)
         AS DOUBLE)                              AS vwap,
         -- Session OHLC from tick data
-        CAST(
-            MIN_BY(price, event_time)
-        AS DOUBLE)                              AS session_open,
-        CAST(MAX(price) AS DOUBLE)              AS session_high,
-        CAST(MIN(price) AS DOUBLE)              AS session_low,
-        CAST(
-            MAX_BY(price, event_time)
-        AS DOUBLE)                              AS session_close,
-        SUM(CAST(volume AS BIGINT))             AS total_volume,
-        COUNT(*)                                AS tick_count,
-        MIN(event_time)                         AS session_start,
-        MAX(event_time)                         AS session_end
+        CAST(MIN_BY(price, event_time) AS DOUBLE) AS session_open,
+        CAST(MAX(price)                AS DOUBLE) AS session_high,
+        CAST(MIN(price)                AS DOUBLE) AS session_low,
+        CAST(MAX_BY(price, event_time) AS DOUBLE) AS session_close,
+        SUM(CAST(volume AS BIGINT))               AS total_volume,
+        COUNT(*)                                  AS tick_count,
+        MIN(event_time)                           AS session_start,
+        MAX(event_time)                           AS session_end
     FROM ticks
     GROUP BY
         symbol,
