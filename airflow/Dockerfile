@@ -1,12 +1,13 @@
-FROM apache/airflow:2.8.0
-
+FROM apache/airflow:2.9.2
+COPY requirements.txt /requirements.txt
+RUN pip install --upgrade pip
+RUN pip install --no-cache-dir -r /requirements.txt
 USER root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        git \
-        build-essential \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && \
+    apt-get -y install git && \
+    apt-get install -y procps && \
+    apt-get install -y default-jre && \
+    apt-get install -y python3-venv && \
+    apt-get clean
 
 USER airflow
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt

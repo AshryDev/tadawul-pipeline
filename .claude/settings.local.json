@@ -20,7 +20,9 @@
       "Bash(docker exec minio:*)",
       "Bash(docker exec:*)",
       "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); fi=d.get\\('failureInfo',{}\\); print\\(fi.get\\('message',''\\)\\); [print\\(c.get\\('message',''\\)\\) for c in fi.get\\('suppressed',[]\\)]\")",
-      "Bash(python3 -c \"import json,sys; c=json.load\\(sys.stdin\\); a=c.get\\('aliases',{}\\).get\\('local',{}\\); print\\('url:',a.get\\('url'\\)\\); print\\('access_key:',a.get\\('accessKey'\\)\\)\")"
+      "Bash(python3 -c \"import json,sys; c=json.load\\(sys.stdin\\); a=c.get\\('aliases',{}\\).get\\('local',{}\\); print\\('url:',a.get\\('url'\\)\\); print\\('access_key:',a.get\\('accessKey'\\)\\)\")",
+      "Bash(docker compose:*)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }

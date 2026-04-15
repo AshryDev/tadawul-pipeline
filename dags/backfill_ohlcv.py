@@ -10,9 +10,10 @@ After ingestion, triggers dbt silver + gold model refresh.
 Idempotency: Deletes the partition for the execution date before re-writing,
 so re-running for the same date is always safe.
 
-Note: Yahoo Finance data availability varies by symbol and date. The DAG
-handles missing results gracefully (logs a warning, continues) rather than
-failing. Tadawul symbols are suffixed with .SR (e.g. 2222.SR for Aramco).
+Data source: Yahoo Finance via the `yfinance` library. Tadawul symbols use
+the `.SR` suffix (e.g. `2222.SR`). Missing data for a symbol on a given date
+(market closed, holiday, symbol not covered) is handled gracefully — a warning
+is logged and the symbol is skipped.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ import logging
 import os
 import subprocess
 import shlex
-import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -59,83 +59,55 @@ BRONZE_OHLCV_SCHEMA = pa.schema(
 
 
 # ── Yahoo Finance helpers ─────────────────────────────────────────────────────
-_RETRY_DELAYS = [60, 120, 300]  # seconds between retries: 1m, 2m, 5m
-_RETRYABLE = ("RateLimit", "Too Many Requests", "TzMissing", "no timezone")
-
-
 def _fetch_ohlcv_all_symbols(date_str: str) -> list[dict]:
     """
-    Fetch one day of OHLCV data for ALL symbols in a single yf.download() call.
+    Fetch one day of OHLCV data for all symbols via Yahoo Finance.
 
-    This is 10x more API-efficient than one call per symbol: stocks_lakehouse
-    uses the same approach and stays well within Yahoo Finance's rate limits.
-    Retries the entire batch on rate-limit or timezone-missing errors.
+    Uses the `.SR` suffix for Tadawul symbols (e.g. `2222.SR`).
+    Missing data for a symbol on a given date (market closed, holiday, symbol
+    not covered) is handled gracefully — a warning is logged and the symbol is
+    skipped.
 
-    Returns a list of record dicts (one per symbol that has data for date_str).
+    Returns a list of record dicts ready to be written to bronze_daily_ohlcv.
     """
-    yf_tickers = [f"{s}.SR" for s in SYMBOLS]
-    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    raw = None
-    for attempt, delay in enumerate(_RETRY_DELAYS + [None], start=1):
-        try:
-            raw = yf.download(
-                tickers=yf_tickers,
-                start=date_str,
-                end=next_day,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=True,
-                progress=False,
-                threads=False,  # sequential within the call — avoids burst spikes
-            )
-            break
-        except Exception as exc:
-            exc_str = str(exc)
-            if any(tag in exc_str for tag in _RETRYABLE):
-                if delay is None:
-                    log.warning("Rate limited after %d attempts — skipping %s.", attempt, date_str)
-                    return []
-                log.warning("Rate limited (attempt %d) — retrying in %ds.", attempt, delay)
-                time.sleep(delay)
-            else:
-                log.warning("yfinance error for %s: %s", date_str, exc)
-                return []
-
-    if raw is None or raw.empty:
-        log.warning("No data from Yahoo Finance for %s (market closed or holiday).", date_str)
-        return []
-
     ingestion_time = datetime.utcnow()
+    end_str = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     records: list[dict] = []
 
-    for symbol, yf_ticker in zip(SYMBOLS, yf_tickers):
+    for symbol in SYMBOLS:
+        yf_ticker = f"{symbol}.SR"
         try:
-            # With group_by='ticker' and multiple tickers, columns are MultiIndex:
-            # level-0 = ticker, level-1 = field (Open/High/Low/Close/Volume)
-            sym_df = raw[yf_ticker] if len(yf_tickers) > 1 else raw
-            if sym_df.empty:
-                log.warning("No data for %s on %s.", yf_ticker, date_str)
-                continue
-            row = sym_df.iloc[0]
-            open_ = float(row["Open"])
-            high  = float(row["High"])
-            low   = float(row["Low"])
-            close = float(row["Close"])
-            records.append({
-                "symbol": symbol,
-                "date": date_str,
-                "open": open_,
-                "high": high,
-                "low": low,
-                "close": close,
-                "volume": int(row["Volume"]),
-                "vwap": round((open_ + high + low + close) / 4, 4),
-                "transactions": 0,
-                "ingestion_time": ingestion_time,
-            })
+            hist = yf.Ticker(yf_ticker).history(start=date_str, end=end_str, auto_adjust=True)
         except Exception as exc:
-            log.warning("Error parsing data for %s on %s: %s", symbol, date_str, exc)
+            log.warning("yfinance error for %s on %s: %s", symbol, date_str, exc)
+            continue
+
+        if hist.empty:
+            log.warning("No data from Yahoo Finance for %s on %s (market closed or symbol not covered).", symbol, date_str)
+            continue
+
+        row = hist.iloc[0]
+        open_  = float(row["Open"])
+        high   = float(row["High"])
+        low    = float(row["Low"])
+        close  = float(row["Close"])
+        volume = int(row["Volume"])
+        # Yahoo Finance doesn't provide VWAP; approximate as OHLC average
+        vwap   = round((open_ + high + low + close) / 4, 4)
+
+        records.append({
+            "symbol": symbol,
+            "date": date_str,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "vwap": vwap,
+            "transactions": 0,  # not provided by Yahoo Finance
+            "ingestion_time": ingestion_time,
+        })
+        log.debug("Fetched %s on %s: close=%.4f vwap=%.4f vol=%d", symbol, date_str, close, vwap, volume)
 
     return records
 
@@ -150,7 +122,9 @@ def _get_catalog():
         **{
             "type": "rest",
             "uri": os.environ.get("NESSIE_URI", "http://nessie:19120/iceberg/"),
-            "warehouse": os.environ.get("MINIO_WAREHOUSE", "s3a://stocks/"),
+            # Nessie 0.100+ identifies warehouses by name, not by S3 URI.
+            # The warehouse "stocks" is configured server-side in Nessie.
+            "warehouse": os.environ.get("NESSIE_WAREHOUSE", "stocks"),
             "s3.endpoint": os.environ.get("MINIO_ENDPOINT", "http://minio:9000"),
             "s3.access-key-id": os.environ.get("MINIO_ACCESS_KEY", "admin"),
             "s3.secret-access-key": os.environ.get("MINIO_SECRET_KEY", "password"),
@@ -214,7 +188,7 @@ def _ensure_bronze_ohlcv_table(catalog) -> Any:
     dag_id="backfill_ohlcv",
     description="Daily OHLCV ingestion from Yahoo Finance → Iceberg bronze_daily_ohlcv (MinIO/Nessie) → dbt silver/gold",
     schedule="@daily",
-    start_date=datetime(2021, 4, 14), 
+    start_date=datetime(2024, 5, 15),
     catchup=True,
     max_active_runs=1,
     default_args={
@@ -229,14 +203,7 @@ def backfill_ohlcv_dag():
 
     @task()
     def fetch_ohlcv(execution_date=None) -> list[dict]:
-        """
-        Fetch OHLCV for all symbols for the DAG execution date.
-
-        Uses a single bulk yf.download() call for all symbols so each DAG run
-        makes only 1 API request instead of 10 (one per symbol). This keeps the
-        request rate ~10x lower than the previous per-symbol approach, matching
-        the stocks_lakehouse strategy that avoids rate limiting.
-        """
+        """Fetch OHLCV for all symbols for the DAG execution date via Yahoo Finance."""
         date_str = execution_date.strftime("%Y-%m-%d")
         log.info("Fetching OHLCV for date %s (bulk, %d symbols).", date_str, len(SYMBOLS))
 
