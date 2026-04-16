@@ -3,7 +3,7 @@
         materialized         = 'incremental',
         unique_key           = ['symbol', 'date'],
         on_schema_change     = 'sync_all_columns',
-        incremental_strategy = 'append',
+        incremental_strategy = 'delete+insert',
         schema               = 'silver',
     )
 }}

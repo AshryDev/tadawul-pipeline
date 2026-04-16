@@ -23,8 +23,10 @@ import os
 import subprocess
 import shlex
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 from typing import Any
 
+import pandas as pd
 import pyarrow as pa
 import yfinance as yf
 from airflow.decorators import dag, task
@@ -44,8 +46,8 @@ SYMBOLS: list[str] = [
 # ── PyArrow schema for bronze_daily_ohlcv ────────────────────────────────────
 BRONZE_OHLCV_SCHEMA = pa.schema(
     [
-        pa.field("symbol", pa.string()),
-        pa.field("date", pa.string()),          # ISO-8601 date string
+        pa.field("symbol", pa.string(), nullable=False),
+        pa.field("date", pa.string(), nullable=False),  # ISO-8601 date string
         pa.field("open", pa.float64()),
         pa.field("high", pa.float64()),
         pa.field("low", pa.float64()),
@@ -53,62 +55,105 @@ BRONZE_OHLCV_SCHEMA = pa.schema(
         pa.field("volume", pa.int64()),
         pa.field("vwap", pa.float64()),
         pa.field("transactions", pa.int64()),
-        pa.field("ingestion_time", pa.timestamp("us", tz="UTC")),
+        pa.field("ingestion_time", pa.timestamp("us")),  # tz-naive matches Iceberg TimestampType
     ]
 )
 
 
 # ── Yahoo Finance helpers ─────────────────────────────────────────────────────
-def _fetch_ohlcv_all_symbols(date_str: str) -> list[dict]:
+
+# Number of months each DAG run covers. Mirrors the 6-month schedule.
+# Override via OHLCV_BATCH_MONTHS env var if needed.
+BATCH_MONTHS: int = int(os.getenv("OHLCV_BATCH_MONTHS", "6"))
+
+
+def _fetch_ohlcv_range(start_str: str, end_str: str) -> list[dict]:
     """
-    Fetch one day of OHLCV data for all symbols via Yahoo Finance.
+    Fetch OHLCV data for all symbols over a date range via Yahoo Finance.
 
-    Uses the `.SR` suffix for Tadawul symbols (e.g. `2222.SR`).
-    Missing data for a symbol on a given date (market closed, holiday, symbol
-    not covered) is handled gracefully — a warning is logged and the symbol is
-    skipped.
+    Uses ``yf.download()`` to pull all tickers in a single HTTP request,
+    which is substantially faster than calling ``Ticker.history()`` per symbol.
 
-    Returns a list of record dicts ready to be written to bronze_daily_ohlcv.
+    ``end_str`` is *exclusive* (Yahoo Finance convention).  Pass the day
+    *after* the last date you want included.
+
+    Returns a list of record dicts (one per symbol × trading day) ready to be
+    written to bronze_daily_ohlcv.
     """
     ingestion_time = datetime.utcnow()
-    end_str = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    yf_tickers = [f"{s}.SR" for s in SYMBOLS]
+
+    log.info(
+        "Downloading %d symbols from %s to %s (exclusive) via yf.download().",
+        len(yf_tickers), start_str, end_str,
+    )
+
+    try:
+        raw: pd.DataFrame = yf.download(
+            tickers=yf_tickers,
+            start=start_str,
+            end=end_str,
+            auto_adjust=True,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
+    except Exception as exc:
+        log.error("yf.download() failed for range %s–%s: %s", start_str, end_str, exc)
+        raise
+
+    if raw.empty:
+        log.warning("yf.download() returned no data for %s–%s.", start_str, end_str)
+        return []
+
     records: list[dict] = []
 
     for symbol in SYMBOLS:
         yf_ticker = f"{symbol}.SR"
+        # When multiple tickers are requested, yf.download returns a
+        # MultiIndex DataFrame with the ticker as the top-level column key.
         try:
-            hist = yf.Ticker(yf_ticker).history(start=date_str, end=end_str, auto_adjust=True)
-        except Exception as exc:
-            log.warning("yfinance error for %s on %s: %s", symbol, date_str, exc)
+            df = raw[yf_ticker] if len(yf_tickers) > 1 else raw
+        except KeyError:
+            log.warning("No data column for %s in download result.", yf_ticker)
             continue
 
-        if hist.empty:
-            log.warning("No data from Yahoo Finance for %s on %s (market closed or symbol not covered).", symbol, date_str)
+        if df.empty:
+            log.warning("No data for %s in range %s–%s.", symbol, start_str, end_str)
             continue
 
-        row = hist.iloc[0]
-        open_  = float(row["Open"])
-        high   = float(row["High"])
-        low    = float(row["Low"])
-        close  = float(row["Close"])
-        volume = int(row["Volume"])
-        # Yahoo Finance doesn't provide VWAP; approximate as OHLC average
-        vwap   = round((open_ + high + low + close) / 4, 4)
+        for ts, row in df.iterrows():
+            # Skip rows where all OHLCV values are NaN (non-trading days)
+            if pd.isna(row.get("Open")):
+                continue
 
-        records.append({
-            "symbol": symbol,
-            "date": date_str,
-            "open": open_,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": volume,
-            "vwap": vwap,
-            "transactions": 0,  # not provided by Yahoo Finance
-            "ingestion_time": ingestion_time,
-        })
-        log.debug("Fetched %s on %s: close=%.4f vwap=%.4f vol=%d", symbol, date_str, close, vwap, volume)
+            date_str = ts.strftime("%Y-%m-%d")
+            open_  = float(row["Open"])
+            high   = float(row["High"])
+            low    = float(row["Low"])
+            close  = float(row["Close"])
+            volume = int(row["Volume"]) if not pd.isna(row["Volume"]) else 0
+            # Yahoo Finance doesn't provide VWAP; approximate as OHLC average
+            vwap   = round((open_ + high + low + close) / 4, 4)
 
+            records.append({
+                "symbol": symbol,
+                "date": date_str,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "vwap": vwap,
+                "transactions": 0,  # not provided by Yahoo Finance
+                "ingestion_time": ingestion_time,
+            })
+            log.debug(
+                "Fetched %s on %s: close=%.4f vwap=%.4f vol=%d",
+                symbol, date_str, close, vwap, volume,
+            )
+
+    log.info("Collected %d records for range %s–%s.", len(records), start_str, end_str)
     return records
 
 
@@ -186,11 +231,13 @@ def _ensure_bronze_ohlcv_table(catalog) -> Any:
 # ── DAG definition ────────────────────────────────────────────────────────────
 @dag(
     dag_id="backfill_ohlcv",
-    description="Daily OHLCV ingestion from Yahoo Finance → Iceberg bronze_daily_ohlcv (MinIO/Nessie) → dbt silver/gold",
-    schedule="@daily",
-    start_date=datetime(2024, 5, 15),
+    description="6-monthly OHLCV ingestion from Yahoo Finance → Iceberg bronze_daily_ohlcv (MinIO/Nessie) → dbt silver/gold",
+    # Runs every 6 months (Jan 1 and Jul 1). Each run covers a 6-month window
+    # starting at the execution date, so the full backfill needs ~2 runs/year.
+    schedule="0 0 1 1,7 *",
+    start_date=datetime(2021, 1, 1),
     catchup=True,
-    max_active_runs=1,
+    max_active_runs=2,
     default_args={
         "owner": "data-engineering",
         "retries": 2,
@@ -203,13 +250,21 @@ def backfill_ohlcv_dag():
 
     @task()
     def fetch_ohlcv(execution_date=None) -> list[dict]:
-        """Fetch OHLCV for all symbols for the DAG execution date via Yahoo Finance."""
-        date_str = execution_date.strftime("%Y-%m-%d")
-        log.info("Fetching OHLCV for date %s (bulk, %d symbols).", date_str, len(SYMBOLS))
+        """
+        Fetch OHLCV for all symbols over a BATCH_MONTHS window starting at the
+        DAG execution date.  Uses yf.download() for a single bulk HTTP request
+        instead of one Ticker.history() call per symbol.
+        """
+        start_str = execution_date.strftime("%Y-%m-%d")
+        end_dt = execution_date + relativedelta(months=BATCH_MONTHS)
+        end_str = end_dt.strftime("%Y-%m-%d")  # exclusive upper bound for yfinance
 
-        records = _fetch_ohlcv_all_symbols(date_str)
-
-        log.info("Fetched %d records for %s.", len(records), date_str)
+        log.info(
+            "Fetching OHLCV for window %s – %s (%d months, %d symbols).",
+            start_str, end_str, BATCH_MONTHS, len(SYMBOLS),
+        )
+        records = _fetch_ohlcv_range(start_str, end_str)
+        log.info("Fetched %d records for window %s – %s.", len(records), start_str, end_str)
         return records
 
     @task()
@@ -217,8 +272,9 @@ def backfill_ohlcv_dag():
         """
         Write records to Iceberg bronze_daily_ohlcv.
 
-        Idempotent: deletes the partition for this date before appending,
-        so re-running for the same date produces correct results.
+        Idempotent: for each distinct date present in the batch, deletes the
+        existing partition before appending, so re-running for the same window
+        produces correct results.
         """
         from pyiceberg.expressions import EqualTo
 
@@ -226,24 +282,32 @@ def backfill_ohlcv_dag():
             log.warning("No records to write — skipping bronze write.")
             return
 
-        date_str = records[0]["date"]
-        log.info("Writing %d records for %s to bronze_daily_ohlcv.", len(records), date_str)
-
         catalog = _get_catalog()
         table = _ensure_bronze_ohlcv_table(catalog)
 
-        # Delete existing partition for this date (idempotency)
-        try:
-            table.delete(EqualTo("date", date_str))
-            log.info("Deleted existing partition for %s.", date_str)
-        except Exception as exc:
-            log.debug("Delete partition skipped (may not exist): %s", exc)
+        # Group records by date so we write (and delete) one partition at a time.
+        dates_seen: dict[str, list[dict]] = {}
+        for rec in records:
+            dates_seen.setdefault(rec["date"], []).append(rec)
 
-        # Convert to PyArrow table and append
-        arrow_table = pa.Table.from_pylist(records, schema=BRONZE_OHLCV_SCHEMA)
-        table.append(arrow_table)
+        log.info(
+            "Writing %d records across %d date partitions to bronze_daily_ohlcv.",
+            len(records), len(dates_seen),
+        )
 
-        log.info("Successfully appended %d rows to bronze_daily_ohlcv.", len(records))
+        for date_str, date_records in sorted(dates_seen.items()):
+            # Delete existing partition for this date (idempotency)
+            try:
+                table.delete(EqualTo("date", date_str))
+                log.info("Deleted existing partition for %s.", date_str)
+            except Exception as exc:
+                log.debug("Delete partition skipped for %s (may not exist): %s", date_str, exc)
+
+            arrow_table = pa.Table.from_pylist(date_records, schema=BRONZE_OHLCV_SCHEMA)
+            table.append(arrow_table)
+            log.info("Appended %d rows for %s.", len(date_records), date_str)
+
+        log.info("Successfully wrote all %d rows to bronze_daily_ohlcv.", len(records))
 
     @task()
     def run_dbt(_upstream: None = None) -> None:
@@ -294,7 +358,7 @@ def backfill_ohlcv_dag():
         log.info("dbt run completed successfully.")
 
     # ── Task dependencies ─────────────────────────────────────────────────────
-    records = fetch_ohlcv()
+    records     = fetch_ohlcv()
     bronze_done = write_bronze(records)
     run_dbt(bronze_done)
 

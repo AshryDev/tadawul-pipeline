@@ -8,4 +8,5 @@ trino
 dbt-core
 dbt-trino
 yfinance
-pyiceberg[s3fs]>=0.6.0
+pyiceberg[s3fs]>=0.6.0,<0.8.0
+scikit-learn>=1.3.0

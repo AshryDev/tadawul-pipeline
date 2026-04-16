@@ -29,6 +29,7 @@ x-airflow-common: &airflow-common
     TRINO_PORT: ${TRINO_PORT:-8080}
     TRINO_CATALOG: ${TRINO_CATALOG:-iceberg}
     TRINO_SCHEMA: ${TRINO_SCHEMA:-silver}
+    AIRFLOW_CONN_TRINO_CONN: "trino://airflow@trino:8080"
     POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
     POSTGRES_PORT: ${POSTGRES_PORT:-5432}
     POSTGRES_USER: ${POSTGRES_USER:-airflow}
@@ -258,7 +259,7 @@ services:
 
   # ── Trino ────────────────────────────────────────────────────────────────────
   trino:
-    image: trinodb/trino:435
+    image: trinodb/trino:455
     hostname: trino
     container_name: trino
     volumes:
@@ -323,6 +324,8 @@ services:
     depends_on:
       mongo:
         condition: service_healthy
+    volumes:
+      - ./nessie/application.properties:/deployments/config/application.properties:ro
     environment:
       - nessie.version.store.type=MONGODB
       - quarkus.mongodb.database=nessie
