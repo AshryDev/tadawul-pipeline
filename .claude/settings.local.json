@@ -23,7 +23,8 @@
       "Bash(python3 -c \"import json,sys; c=json.load\\(sys.stdin\\); a=c.get\\('aliases',{}\\).get\\('local',{}\\); print\\('url:',a.get\\('url'\\)\\); print\\('access_key:',a.get\\('accessKey'\\)\\)\")",
       "Bash(docker compose:*)",
       "Bash(grep -v \"^$\")",
-      "Bash(cat D:/Code/tadawul-pipeline/nessie/*)"
+      "Bash(cat D:/Code/tadawul-pipeline/nessie/*)",
+      "Read(//d/Code/**)"
     ]
   }
 }

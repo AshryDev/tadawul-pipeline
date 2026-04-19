@@ -336,7 +336,7 @@ def backfill_ohlcv_dag():
             # Exclude tick-dependent models (silver_ticks_cleaned,
             # gold_intraday_vwap) — those require bronze_ticks which is
             # written by the Spark streaming consumer, not this batch DAG.
-            ("dbt run",  f"dbt run --select silver_ohlcv+ silver_symbols {dbt_flags}"),
+            ("dbt run",  f"dbt run --select silver_ohlcv+ silver_symbols gold_technical_rating {dbt_flags}"),
         ]:
             log.info("Running: %s", cmd)
             result = subprocess.run(

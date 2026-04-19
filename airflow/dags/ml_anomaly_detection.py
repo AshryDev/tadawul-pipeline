@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import warnings
-from datetime import datetime, timedelta, date as date_type
+from datetime import datetime, timedelta, date as date_type, timezone
 from dateutil.relativedelta import relativedelta
 
 import numpy as np
@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 log = logging.getLogger(__name__)
 
-TRINO_CONN_ID: str = os.getenv("AIRFLOW_CONN_TRINO_CONN", "trino_conn")
+TRINO_CONN_ID: str = os.getenv("TRINO_CONN_ID", "trino_conn")
 
 # Months scored per run — matches backfill_ohlcv
 BATCH_MONTHS: int = int(os.getenv("ML_BATCH_MONTHS", "6"))
@@ -75,7 +75,7 @@ ANOMALY_SCHEMA = pa.schema([
     pa.field("score",        pa.float64()),
     pa.field("threshold",    pa.float64()),
     pa.field("is_anomaly",   pa.bool_()),
-    pa.field("detected_at",  pa.timestamp("us")),
+    pa.field("detected_at",  pa.timestamp("us", tz="UTC")),
 ])
 
 
@@ -194,7 +194,7 @@ def ml_anomaly_detection_dag():
         window_end_str   = (
             execution_date + relativedelta(months=BATCH_MONTHS)
         ).strftime("%Y-%m-%d")
-        detected_at = datetime.utcnow().isoformat()
+        detected_at = datetime.now(timezone.utc).isoformat()
 
         df = pd.DataFrame(records)
         df["date"] = df["date"].astype(str)
@@ -359,7 +359,7 @@ def ml_anomaly_detection_dag():
                 {
                     **r,
                     "date":       date_type.fromisoformat(r["date"]),
-                    "detected_at": datetime.fromisoformat(r["detected_at"]),
+                    "detected_at": datetime.fromisoformat(r["detected_at"]).astimezone(timezone.utc),
                 }
                 for r in recs
             ]

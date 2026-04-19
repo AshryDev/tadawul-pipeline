@@ -167,6 +167,39 @@ _DDL: list[str] = [
         dbt_updated_at  TIMESTAMP
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS neon.public.gold_technical_rating (
+        symbol          VARCHAR NOT NULL,
+        company_name    VARCHAR,
+        sector          VARCHAR,
+        market_cap_tier VARCHAR,
+        date            DATE    NOT NULL,
+        close           DOUBLE,
+        volume          BIGINT,
+        avg_volume_20d  DOUBLE,
+        sma10           DOUBLE,
+        sma20           DOUBLE,
+        sma50           DOUBLE,
+        sma200          DOUBLE,
+        bb_lower        DOUBLE,
+        bb_upper        DOUBLE,
+        rsi14           DOUBLE,
+        sig_price_sma10  INTEGER,
+        sig_price_sma20  INTEGER,
+        sig_price_sma50  INTEGER,
+        sig_price_sma200 INTEGER,
+        sig_ma_cross     INTEGER,
+        sig_rsi          INTEGER,
+        sig_bb           INTEGER,
+        sig_macd_proxy   INTEGER,
+        buy_signals      INTEGER,
+        sell_signals     INTEGER,
+        neutral_signals  INTEGER,
+        signal_score     INTEGER,
+        rating           VARCHAR,
+        dbt_updated_at   TIMESTAMP
+    )
+    """,
 ]
 
 
@@ -241,12 +274,13 @@ def sync_to_neon_dag():
         produces the correct result.
 
         Tables and their date-partition columns:
-            silver_ohlcv            → date
-            gold_52w_levels         → date
-            gold_anomaly_flags      → date
-            gold_sector_performance → date
-            gold_volatility_index   → date
-            gold_intraday_vwap      → session_date
+            silver_ohlcv              → date
+            gold_52w_levels           → date
+            gold_anomaly_flags        → date
+            gold_sector_performance   → date
+            gold_volatility_index     → date
+            gold_intraday_vwap        → session_date
+            gold_technical_rating     → date
         """
         start_str = execution_date.strftime("%Y-%m-%d")
         end_str   = (execution_date + timedelta(days=BATCH_DAYS)).strftime("%Y-%m-%d")
@@ -259,6 +293,7 @@ def sync_to_neon_dag():
             ("gold_sector_performance", "gold",   "gold_sector_performance",   "date"),
             ("gold_volatility_index",   "gold",   "gold_volatility_index",     "date"),
             ("gold_intraday_vwap",      "gold",   "gold_intraday_vwap",        "session_date"),
+            ("gold_technical_rating",   "gold",   "gold_technical_rating",     "date"),
         ]
 
         log.info("Syncing window %s – %s (%d tables).", start_str, end_str, len(TABLES))

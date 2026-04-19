@@ -93,6 +93,34 @@ models:
       - name: detected_at
         description: "Timestamp when the anomaly was detected."
 
+  - name: gold_technical_rating
+    description: >
+      TradingView-style technical rating per symbol per day. Eight indicator
+      signals (price vs SMAs, MA cross, RSI, Bollinger Bands, MACD proxy)
+      each vote buy/neutral/sell. Net score maps to Strong Buy / Buy /
+      Neutral / Sell / Strong Sell.
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: date
+        tests: [not_null]
+      - name: rating
+        description: "Strong Buy | Buy | Neutral | Sell | Strong Sell"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell"]
+      - name: signal_score
+        description: "Net vote score from -8 (all sell) to +8 (all buy)."
+      - name: buy_signals
+        description: "Count of indicators voting buy (0–8)."
+      - name: sell_signals
+        description: "Count of indicators voting sell (0–8)."
+      - name: rsi14
+        description: "14-day RSI. <30 oversold, >70 overbought."
+      - name: sma200
+        description: "200-day simple moving average."
+
   - name: gold_52w_levels
     description: >
       52-week high/low proximity analysis. Highlights near-breakout or
