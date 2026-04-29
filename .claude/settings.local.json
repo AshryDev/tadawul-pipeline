@@ -24,7 +24,16 @@
       "Bash(docker compose:*)",
       "Bash(grep -v \"^$\")",
       "Bash(cat D:/Code/tadawul-pipeline/nessie/*)",
-      "Read(//d/Code/**)"
+      "Read(//d/Code/**)",
+      "Bash(git *)",
+      "Bash(python3 *)",
+      "Bash(brew install *)",
+      "Bash(pdftotext /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/kbs_lectures.pdf -)",
+      "Bash(cp /Users/ahmedashry/.claude/image-cache/dc502b9b-97f3-4d51-9bc0-c039ddd67c81/3.png /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/figures/fig3_anomaly_detection.png)",
+      "Bash(cp /Users/ahmedashry/.claude/image-cache/dc502b9b-97f3-4d51-9bc0-c039ddd67c81/4.png /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/figures/fig4_cf_number_line.png)",
+      "Bash(cp /Users/ahmedashry/.claude/image-cache/dc502b9b-97f3-4d51-9bc0-c039ddd67c81/5.png /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/figures/fig5_dikw_medallion.png)",
+      "Bash(cp /Users/ahmedashry/.claude/image-cache/dc502b9b-97f3-4d51-9bc0-c039ddd67c81/6.png /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/figures/fig6_kbs_architecture.png)",
+      "Bash(grep *)"
     ]
   }
 }

@@ -22,8 +22,10 @@ import os
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from datetime import time as dtime
+from functools import partial
 
 import numpy as np
 import pytz
@@ -32,6 +34,12 @@ from confluent_kafka import Producer
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# tadawul_symbols.py lives in airflow/dags/ — resolve relative to this file.
+_dags_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "airflow", "dags")
+if _dags_dir not in sys.path:
+    sys.path.insert(0, _dags_dir)
+from tadawul_symbols import BASE_PRICES, get_symbols  # noqa: E402
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -48,13 +56,12 @@ KAFKA_TOPIC_TICKS: str = os.getenv("KAFKA_TOPIC_TICKS", "tadawul.ticks")
 POLL_INTERVAL_SECONDS: float = 3.0
 POLYGON_BASE_URL: str = "https://api.polygon.io/v2/aggs/ticker"
 
-SYMBOLS: list[str] = [
-    s.strip()
-    for s in os.getenv(
-        "SYMBOLS", "2222,1010,2010,7010,1120,4280,2380,8010,4003,2060"
-    ).split(",")
-    if s.strip()
-]
+SYMBOLS: list[str] = get_symbols()
+
+# Number of threads used to build ticks in parallel (Polygon calls or simulation).
+# confluent_kafka.Producer.produce() is NOT thread-safe; ticks are collected
+# from the thread pool then produced from the main thread.
+_TICK_WORKERS: int = min(32, len(SYMBOLS))
 
 # ── Market hours (Tadawul: Sun–Thu, 10:00–15:00 Riyadh time = UTC+3) ─────────
 RIYADH_TZ = pytz.timezone("Asia/Riyadh")
@@ -64,20 +71,8 @@ MARKET_CLOSE = dtime(15, 0)
 TRADING_DAYS: frozenset[int] = frozenset({6, 0, 1, 2, 3})  # Sun through Thu
 
 # ── Simulation state (module-level for continuity across ticks) ───────────────
-# Seed with realistic base prices for each symbol (SAR)
-_BASE_PRICES: dict[str, float] = {
-    "2222": 30.0,   # Aramco
-    "1010": 95.0,   # Al Rajhi Bank
-    "2010": 120.0,  # SABIC
-    "7010": 55.0,   # STC
-    "1120": 16.0,   # Al Jazira Bank
-    "4280": 185.0,  # Jarir Bookstore
-    "2380": 25.0,   # Petro Rabigh
-    "8010": 48.0,   # SABB
-    "4003": 40.0,   # Bahri
-    "2060": 15.0,   # Saudi Kayan
-}
-_last_prices: dict[str, float] = dict(_BASE_PRICES)
+# BASE_PRICES is imported from tadawul_symbols; unknown symbols default to 100.0.
+_last_prices: dict[str, float] = dict(BASE_PRICES)
 
 # Graceful shutdown flag
 _running = True
@@ -163,7 +158,7 @@ def simulate_tick(symbol: str) -> dict:
     Volume:      normally distributed around 10M shares, σ=2M, clipped at 1.
     Spread:      0.1% of mid-price (realistic for liquid Tadawul stocks).
     """
-    base = _last_prices.get(symbol, _BASE_PRICES.get(symbol, 100.0))
+    base = _last_prices.get(symbol, BASE_PRICES.get(symbol, 100.0))
     drift = float(np.random.normal(0.0, 0.001))
     new_price = max(round(base * (1.0 + drift), 4), 0.01)
     _last_prices[symbol] = new_price
@@ -244,8 +239,17 @@ def main() -> None:
             open_flag = is_market_open()
             status_label = "LIVE" if open_flag else "SIMULATED"
 
-            for symbol in SYMBOLS:
-                tick = build_tick(symbol, open_flag)
+            # Build all ticks in parallel (parallelises Polygon I/O during live
+            # sessions; negligible overhead during simulation).
+            _build = partial(build_tick, market_open=open_flag)
+            with ThreadPoolExecutor(max_workers=_TICK_WORKERS) as pool:
+                ticks = list(pool.map(_build, SYMBOLS))
+
+            # Produce from main thread — confluent_kafka Producer is not thread-safe.
+            published = 0
+            for symbol, tick in zip(SYMBOLS, ticks):
+                if tick is None:
+                    continue
                 payload = json.dumps(tick).encode("utf-8")
                 producer.produce(
                     topic=KAFKA_TOPIC_TICKS,
@@ -253,12 +257,12 @@ def main() -> None:
                     value=payload,
                     callback=delivery_callback,
                 )
-                # Trigger delivery callbacks without blocking
                 producer.poll(0)
+                published += 1
 
             log.info(
                 "Published %d ticks [%s] to %s",
-                len(SYMBOLS),
+                published,
                 status_label,
                 KAFKA_TOPIC_TICKS,
             )

@@ -1,0 +1,14 @@
+rule_id,rule_name,category,indicator_column,vote_direction,condition_description,certainty_factor,is_active,source_reference
+R01,price_above_sma10,inference,sig_price_sma10,BUY,close > SMA10 — short-term price above 10-day average,0.30,true,Murphy: Technical Analysis of Financial Markets
+R02,price_above_sma20,inference,sig_price_sma20,BUY,close > SMA20 — medium-term price above 20-day average,0.40,true,Murphy: Technical Analysis of Financial Markets
+R03,price_above_sma50,inference,sig_price_sma50,BUY,close > SMA50 — trend confirmation above 50-day average,0.50,true,Murphy: Technical Analysis of Financial Markets
+R04,price_above_sma200,inference,sig_price_sma200,BUY,close > SMA200 — primary uptrend above 200-day average,0.60,true,Murphy: Technical Analysis of Financial Markets
+R05,golden_cross,inference,sig_ma_cross,BUY,SMA10 > SMA20 — short-term MA crosses above medium-term MA,0.50,true,Pring: Intermarket Analysis
+R06,rsi_oversold,inference,sig_rsi,BUY,RSI(14) < 30 — oversold condition suggests mean reversion,0.70,true,Wilder: New Concepts in Technical Trading Systems
+R07,bollinger_lower_touch,inference,sig_bb,BUY,close < BB_lower (SMA20 - 2sigma) — price at statistical extreme,0.60,true,Bollinger: Bollinger on Bollinger Bands
+R08,macd_bullish_proxy,inference,sig_macd_proxy,BUY,SMA12 > SMA26 — MACD proxy indicates bullish momentum,0.40,true,Murphy: Technical Analysis of Financial Markets
+G01,no_price_anomaly_gate,knowledge,has_price_anomaly,BLOCK_BUY,Price IQR anomaly detected — avoid entering on a spike,1.00,true,Tadawul KBS Risk Gate
+G02,sector_advance_gate,knowledge,sector_advance_ratio,BLOCK_BUY,Sector advance ratio < 50% — broad sector headwind present,0.80,true,Tadawul KBS Sector Gate
+G03,high_volatility_gate,knowledge,annualized_vol,BLOCK_BUY,Annualised volatility > 80% — extreme risk environment,0.90,true,Tadawul KBS Volatility Gate
+M01,market_anomaly_metarule,metarule,market_anomaly_rate,TIGHTEN_BUY,Market-wide price anomaly rate > 30% — tighten BUY to signal_score >= 6,0.90,true,Tadawul KBS Metarule
+M02,consecutive_down_metarule,metarule,consecutive_down_days,BLOCK_BUY,Symbol had 3 consecutive days with log_return < -2% — sustained selling pressure,0.80,true,Tadawul KBS Metarule

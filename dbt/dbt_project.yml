@@ -18,6 +18,17 @@ on-run-start:
   - "CREATE SCHEMA IF NOT EXISTS iceberg.bronze WITH (location = 's3a://stocks/bronze/')"
   - "CREATE SCHEMA IF NOT EXISTS iceberg.silver WITH (location = 's3a://stocks/silver/')"
   - "CREATE SCHEMA IF NOT EXISTS iceberg.gold WITH (location = 's3a://stocks/gold/')"
+  - "CREATE SCHEMA IF NOT EXISTS iceberg.decision WITH (location = 's3a://stocks/decision/')"
+
+seeds:
+  lakehouse:
+    +schema: decision
+    knowledge_rules:
+      +column_types:
+        certainty_factor: double
+        is_active: boolean
+    decision_table:
+      +column_types: {}
 
 models:
   lakehouse:
@@ -27,3 +38,6 @@ models:
     gold:
       +materialized: incremental
       +schema: gold
+    decision:
+      +materialized: incremental
+      +schema: decision

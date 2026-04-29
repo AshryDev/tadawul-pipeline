@@ -30,17 +30,12 @@ import pandas as pd
 import pyarrow as pa
 import yfinance as yf
 from airflow.decorators import dag, task
+from tadawul_symbols import get_symbols
 
 log = logging.getLogger(__name__)
 
 # ── Symbols ───────────────────────────────────────────────────────────────────
-SYMBOLS: list[str] = [
-    s.strip()
-    for s in os.getenv(
-        "SYMBOLS", "2222,1010,2010,7010,1120,4280,2380,8010,4003,2060"
-    ).split(",")
-    if s.strip()
-]
+SYMBOLS: list[str] = get_symbols()
 
 
 # ── PyArrow schema for bronze_daily_ohlcv ────────────────────────────────────

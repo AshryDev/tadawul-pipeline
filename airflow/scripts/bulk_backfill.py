@@ -20,6 +20,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+import sys
 import pandas as pd
 import pyarrow as pa
 import yfinance as yf
@@ -30,13 +31,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SYMBOLS: list[str] = [
-    s.strip()
-    for s in os.getenv(
-        "SYMBOLS", "2222,1010,2010,7010,1120,4280,2380,8010,4003,2060"
-    ).split(",")
-    if s.strip()
-]
+# dags/ is mounted at /opt/airflow/dags in the Airflow container
+_dags_dir = os.path.join(os.path.dirname(__file__), "..", "dags")
+if _dags_dir not in sys.path:
+    sys.path.insert(0, _dags_dir)
+
+from tadawul_symbols import get_symbols  # noqa: E402
+
+SYMBOLS: list[str] = get_symbols()
 
 BRONZE_OHLCV_SCHEMA = pa.schema(
     [

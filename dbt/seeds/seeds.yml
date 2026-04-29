@@ -1,0 +1,58 @@
+version: 2
+
+seeds:
+  - name: knowledge_rules
+    description: >
+      Named Knowledge Base for the Tadawul KBS decision layer (Lecture 4 §4.1–4.2,
+      Lecture 6 §6.9). Each row is a named rule — inference rule, knowledge gate,
+      or metarule — with an associated certainty factor (Lecture 4 §4.10).
+
+      This CSV is the Knowledge Acquisition interface (Lecture 7 §7.4 KA module).
+      Domain experts can add, modify, or deactivate rules by editing this file and
+      running: dbt seed --select knowledge_rules
+    columns:
+      - name: rule_id
+        description: "Unique rule identifier (R01–R08 inference, G01–G03 gates, M01–M02 metarules)."
+        tests: [not_null, unique]
+      - name: rule_name
+        description: "Short snake_case name for the rule."
+        tests: [not_null]
+      - name: category
+        description: "Rule category: inference | knowledge | metarule."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["inference", "knowledge", "metarule"]
+      - name: indicator_column
+        description: "The gold_technical_rating column or derived metric this rule operates on."
+        tests: [not_null]
+      - name: vote_direction
+        description: "What the rule asserts: BUY | BLOCK_BUY | TIGHTEN_BUY | SELL."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["BUY", "SELL", "BLOCK_BUY", "TIGHTEN_BUY"]
+      - name: certainty_factor
+        description: "Belief strength for this rule (0.0–1.0). Used in CF combination formula (§4.10)."
+        tests: [not_null]
+      - name: is_active
+        description: "Set to false to deactivate a rule without removing it from the KB."
+        tests: [not_null]
+      - name: source_reference
+        description: "Academic or domain source that justifies the rule."
+
+  - name: decision_table
+    description: >
+      Exhaustive decision table (Lecture 4 §4.7) mapping all reachable input
+      combinations to expected output signals. Used to verify the decision_signals
+      model handles every case correctly and to document the complete rule space.
+    columns:
+      - name: state_id
+        description: "Unique state identifier."
+        tests: [not_null, unique]
+      - name: expected_signal
+        description: "The signal this combination should produce."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["BUY", "SELL", "HOLD"]

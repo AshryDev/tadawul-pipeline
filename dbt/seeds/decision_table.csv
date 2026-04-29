@@ -1,0 +1,21 @@
+state_id,rating_category,has_price_anomaly,sector_advance_gte_50pct,signal_score_negative,any_metarule_blocks_buy,expected_signal,confidence_direction,notes
+S01,strong_buy,false,true,false,false,BUY,HIGH,All BUY conditions met — strong buy rating with full gate passage
+S02,buy,false,true,false,false,BUY,MEDIUM,All BUY conditions met — buy rating with full gate passage
+S03,strong_buy,false,false,false,false,HOLD,HIGH,BUY blocked by G02 — sector advance ratio below 50%
+S04,buy,false,false,false,false,HOLD,MEDIUM,BUY blocked by G02 — sector advance ratio below 50%
+S05,strong_buy,true,true,false,false,HOLD,HIGH,BUY blocked by G01 — price anomaly detected despite strong rating
+S06,buy,true,true,false,false,HOLD,MEDIUM,BUY blocked by G01 — price anomaly detected despite buy rating
+S07,strong_buy,false,true,false,true,HOLD,HIGH,BUY blocked by metarule — G03 extreme volatility or M01 tighten or M02 down streak
+S08,buy,false,true,false,true,HOLD,MEDIUM,BUY blocked by metarule — score insufficient after M01 tighten
+S09,neutral,false,true,false,false,HOLD,LOW,Neutral rating — not enough conviction for BUY or SELL
+S10,neutral,false,false,false,false,HOLD,LOW,Neutral rating with sector headwind — clear HOLD
+S11,neutral,true,true,false,false,HOLD,LOW,Anomaly present but signal_score non-negative — anomaly SELL requires score < 0
+S12,neutral,true,any,true,false,SELL,LOW,Anomaly fires + signal_score negative — SELL triggered via anomaly path
+S13,sell,false,false,false,false,SELL,MEDIUM,Sell rating triggers SELL regardless of sector direction
+S14,sell,false,true,false,false,SELL,MEDIUM,Sell rating triggers SELL even when sector is advancing
+S15,strong_sell,false,false,false,false,SELL,HIGH,Strong Sell triggers SELL — high conviction bearish
+S16,strong_sell,false,true,false,false,SELL,HIGH,Strong Sell triggers SELL — high conviction bearish
+S17,strong_sell,true,false,true,false,SELL,HIGH,Strong Sell + anomaly + negative score — compounded SELL signal
+S18,sell,true,any,true,false,SELL,MEDIUM,Sell rating + anomaly confirmation — SELL via both paths
+S19,buy,true,false,false,false,HOLD,MEDIUM,BUY blocked by both G01 anomaly and G02 sector gate
+S20,strong_buy,true,false,false,false,HOLD,HIGH,Both gates block BUY — strong rating but unsafe conditions

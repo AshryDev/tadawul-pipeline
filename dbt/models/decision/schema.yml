@@ -1,0 +1,159 @@
+version: 2
+
+models:
+  - name: decision_cf_engine
+    description: >
+      Applies the Certainty Factor (CF) combination formula across all 8 technical
+      indicator votes to produce a single combined_cf per (symbol, date).
+      Implements Lecture 4 §4.10 — Certainty Factors.
+      Rule CFs are read from the knowledge_rules seed (the named Knowledge Base).
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: date
+        tests: [not_null]
+      - name: combined_cf
+        description: "Final combined certainty factor (−1.0 to +1.0). Negative = sell conviction, positive = buy conviction."
+        tests: [not_null]
+      - name: cf_confidence
+        description: "HIGH if |combined_cf|≥0.65, MEDIUM if ≥0.40, LOW otherwise."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["HIGH", "MEDIUM", "LOW"]
+
+  - name: decision_metarule_flags
+    description: >
+      Evaluates three metarules per symbol per day (Lecture 4 §4.2 — Metarules).
+      M01: market-wide anomaly rate > 30% tightens BUY threshold.
+      M02: 3 consecutive down days blocks BUY.
+      G03: extreme volatility (> 80% ann.) blocks BUY.
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: date
+        tests: [not_null]
+      - name: required_score_for_buy
+        description: "Minimum signal_score for a BUY. 3 normally; 6 when M01 fires."
+        tests: [not_null]
+      - name: active_metarules
+        description: "Space-separated list of fired metarule IDs (e.g. 'M01 G03'), or empty string."
+
+  - name: decision_signals
+    description: >
+      Final BUY / SELL / HOLD signal per symbol per day with full KBS-compliant
+      explanation facility (Lecture 4 §4.8–4.9: Why, Why Not, How trace).
+      Aggregates gold_technical_rating, gold_52w_levels, gold_volatility_index,
+      gold_anomaly_flags, gold_sector_performance, decision_cf_engine, and
+      decision_metarule_flags into one actionable row per (symbol, date).
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: date
+        tests: [not_null]
+      - name: close
+        tests: [not_null]
+      - name: signal
+        description: "Actionable instruction: BUY, SELL, or HOLD."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["BUY", "SELL", "HOLD"]
+      - name: confidence
+        description: "Conviction level based on CF combination: HIGH / MEDIUM / LOW."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["HIGH", "MEDIUM", "LOW"]
+      - name: explanation
+        description: "Backward-compatible summary string with rating, RSI, 52W levels, anomaly flags."
+        tests: [not_null]
+      - name: why_signal
+        description: "Why this specific signal was generated (§4.8 Why explanation)."
+        tests: [not_null]
+      - name: why_not_buy
+        description: "Which gate/rule blocked BUY. NULL when signal = BUY (§4.8 Why Not)."
+      - name: why_not_sell
+        description: "Why SELL was not triggered. NULL when signal = SELL (§4.8 Why Not)."
+      - name: reasoning_trace
+        description: "Numbered step-by-step inference trace (§4.9 Tracing / How explanation)."
+        tests: [not_null]
+      - name: combined_cf
+        description: "Combined certainty factor from decision_cf_engine (§4.10)."
+      - name: cf_confidence
+        description: "Confidence tier from CF formula: HIGH / MEDIUM / LOW."
+        tests:
+          - accepted_values:
+              values: ["HIGH", "MEDIUM", "LOW"]
+      - name: active_metarules
+        description: "Metarule IDs that fired today for this symbol."
+      - name: required_score_for_buy
+        description: "Minimum signal_score required for BUY (adjusted by M01 metarule)."
+
+  - name: decision_case_outcomes
+    description: >
+      CBR case library — Retain step (Lecture 7 §7.8–7.10).
+      Shell model that defines the schema; rows are appended by the Airflow
+      DAG decision_cbr_outcomes. Stores resolved signal outcomes (WIN/LOSS)
+      for use by decision_cbr_lookup (Retrieve step).
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: signal_date
+        tests: [not_null]
+      - name: signal
+        tests:
+          - accepted_values:
+              values: ["BUY", "SELL", "HOLD"]
+      - name: outcome
+        description: "WIN or LOSS based on forward return vs signal direction."
+        tests:
+          - accepted_values:
+              values: ["WIN", "LOSS"]
+      - name: return_5d
+        description: "5-day forward return: (close_t+5 - close_t) / close_t."
+      - name: return_20d
+        description: "20-day forward return: (close_t+20 - close_t) / close_t."
+
+  - name: decision_cbr_lookup
+    description: >
+      CBR Retrieve and Reuse steps (Lecture 7 §7.8–7.10). For each current
+      (symbol, date), finds historically similar market situations using 5-bin
+      feature matching (vol, RSI, 52W position, sector momentum, signal score)
+      and reports aggregate win rates and returns from similar past cases.
+    columns:
+      - name: symbol
+        tests: [not_null]
+      - name: date
+        tests: [not_null]
+      - name: similar_cases_count
+        description: "Number of historical cases with ≥ 3 matching feature bins."
+      - name: cbr_win_rate
+        description: "Fraction of similar cases where the signal outcome was WIN."
+      - name: cbr_avg_return_5d
+        description: "Average 5-day return across similar historical cases."
+      - name: cbr_note
+        description: "Human-readable CBR summary, or 'Insufficient history' message."
+
+  - name: decision_validation
+    description: >
+      Signal accuracy and reliability metrics per month, signal type, and sector.
+      Implements Lecture 4 §4.11–4.12 — Evaluation, Validation, and Verification.
+      Measures: Accuracy, Reliability, Sensitivity (signals near decision boundary).
+      Populated once decision_case_outcomes has data from the CBR DAG.
+    columns:
+      - name: month
+        tests: [not_null]
+      - name: signal
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["BUY", "SELL", "HOLD"]
+      - name: sector
+        tests: [not_null]
+      - name: accuracy
+        description: "Fraction of signals with outcome = WIN (§4.12 Accuracy)."
+      - name: reliability
+        description: "Fraction of predictions empirically correct (§4.12 Reliability)."
+      - name: threshold_sensitive_count
+        description: "Signals near the CF decision boundary (|CF| 0.35–0.45) — §4.12 Sensitivity."

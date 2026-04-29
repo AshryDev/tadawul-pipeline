@@ -35,7 +35,7 @@ x-airflow-common: &airflow-common
     POSTGRES_USER: ${POSTGRES_USER:-airflow}
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
     POSTGRES_DB: ${POSTGRES_DB:-airflow}
-    SYMBOLS: ${SYMBOLS:-2222,1010,2010,7010,1120,4280,2380,8010,4003,2060}
+    SYMBOLS: ${SYMBOLS:-}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/scripts:/opt/airflow/scripts
