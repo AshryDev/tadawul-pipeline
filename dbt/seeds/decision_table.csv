@@ -1,21 +1,36 @@
-state_id,rating_category,has_price_anomaly,sector_advance_gte_50pct,signal_score_negative,any_metarule_blocks_buy,expected_signal,confidence_direction,notes
-S01,strong_buy,false,true,false,false,BUY,HIGH,All BUY conditions met — strong buy rating with full gate passage
-S02,buy,false,true,false,false,BUY,MEDIUM,All BUY conditions met — buy rating with full gate passage
-S03,strong_buy,false,false,false,false,HOLD,HIGH,BUY blocked by G02 — sector advance ratio below 50%
-S04,buy,false,false,false,false,HOLD,MEDIUM,BUY blocked by G02 — sector advance ratio below 50%
-S05,strong_buy,true,true,false,false,HOLD,HIGH,BUY blocked by G01 — price anomaly detected despite strong rating
-S06,buy,true,true,false,false,HOLD,MEDIUM,BUY blocked by G01 — price anomaly detected despite buy rating
-S07,strong_buy,false,true,false,true,HOLD,HIGH,BUY blocked by metarule — G03 extreme volatility or M01 tighten or M02 down streak
-S08,buy,false,true,false,true,HOLD,MEDIUM,BUY blocked by metarule — score insufficient after M01 tighten
-S09,neutral,false,true,false,false,HOLD,LOW,Neutral rating — not enough conviction for BUY or SELL
-S10,neutral,false,false,false,false,HOLD,LOW,Neutral rating with sector headwind — clear HOLD
-S11,neutral,true,true,false,false,HOLD,LOW,Anomaly present but signal_score non-negative — anomaly SELL requires score < 0
-S12,neutral,true,any,true,false,SELL,LOW,Anomaly fires + signal_score negative — SELL triggered via anomaly path
-S13,sell,false,false,false,false,SELL,MEDIUM,Sell rating triggers SELL regardless of sector direction
-S14,sell,false,true,false,false,SELL,MEDIUM,Sell rating triggers SELL even when sector is advancing
-S15,strong_sell,false,false,false,false,SELL,HIGH,Strong Sell triggers SELL — high conviction bearish
-S16,strong_sell,false,true,false,false,SELL,HIGH,Strong Sell triggers SELL — high conviction bearish
-S17,strong_sell,true,false,true,false,SELL,HIGH,Strong Sell + anomaly + negative score — compounded SELL signal
-S18,sell,true,any,true,false,SELL,MEDIUM,Sell rating + anomaly confirmation — SELL via both paths
-S19,buy,true,false,false,false,HOLD,MEDIUM,BUY blocked by both G01 anomaly and G02 sector gate
-S20,strong_buy,true,false,false,false,HOLD,HIGH,Both gates block BUY — strong rating but unsafe conditions
+state_id,condition_group,rating_group,signal,signal_cf,confidence,description
+S01,anomaly_highvol,Strong Buy,HOLD,-0.10,LOW,Anomaly or high/extreme vol blocks BUY — protect gate fires despite strong technicals
+S02,anomaly_highvol,Buy,HOLD,-0.10,LOW,Anomaly or high/extreme vol blocks BUY — elevated risk despite Buy rating
+S03,anomaly_highvol,Neutral,HOLD,-0.18,LOW,Anomaly or high/extreme vol with Neutral rating — caution confirmed
+S04,anomaly_highvol,Sell,SELL,-0.75,HIGH,Sell rating + protect gate = compounded bearish confirmation
+S05,anomaly_highvol,Strong Sell,SELL,-0.88,HIGH,Strong Sell + protect gate = maximum bearish conviction
+S06,sector_weak,Strong Buy,HOLD,0.12,LOW,Sector advance ratio <50% blocks BUY despite strong technicals
+S07,sector_weak,Buy,HOLD,0.00,LOW,Sector headwind cancels Buy conviction — wait for sector recovery
+S08,sector_weak,Neutral,HOLD,-0.08,LOW,Neutral rating in declining sector — slight negative lean
+S09,sector_weak,Sell,SELL,-0.75,HIGH,Sell + declining sector = double bearish confirmation
+S10,sector_weak,Strong Sell,SELL,-0.88,HIGH,Strong Sell + weak sector = maximum bearish conviction
+S11,sector_ok_lowvol,Strong Buy,BUY,0.88,HIGH,Optimal setup: strong technicals + advancing sector + low volatility
+S12,sector_ok_lowvol,Buy,BUY,0.70,HIGH,Favorable conditions: advancing sector + low vol + Buy rating
+S13,sector_ok_lowvol,Neutral,HOLD,0.00,LOW,Clean environment but no directional signal — neutral hold
+S14,sector_ok_lowvol,Sell,SELL,-0.70,HIGH,Sell signal in low-vol advancing sector — reliable bearish setup
+S15,sector_ok_lowvol,Strong Sell,SELL,-0.90,HIGH,Strong Sell in clean environment — high conviction bearish
+S16,near_52w_low,Strong Buy,BUY,0.92,HIGH,Best entry: Strong Buy + near 52W low (mean reversion support)
+S17,near_52w_low,Buy,BUY,0.80,HIGH,Good technicals + near 52W low — mean reversion supported
+S18,near_52w_low,Neutral,HOLD,0.12,LOW,Near 52W low — mean reversion potential with no technical confirmation
+S19,near_52w_low,Sell,SELL,-0.52,MEDIUM,Sell near 52W low — support dampens conviction but signal remains SELL
+S20,near_52w_low,Strong Sell,SELL,-0.68,HIGH,Strong Sell despite 52W low support — downside confirmed
+S21,near_52w_high,Strong Buy,BUY,0.72,HIGH,Strong Buy near 52W high — resistance noted but momentum confirmed
+S22,near_52w_high,Buy,BUY,0.55,MEDIUM,Buy near 52W high — resistance moderates conviction
+S23,near_52w_high,Neutral,HOLD,-0.08,LOW,At resistance near 52W high — slight pullback risk
+S24,near_52w_high,Sell,SELL,-0.82,HIGH,Sell from near 52W high — confirmed breakdown from peak
+S25,near_52w_high,Strong Sell,SELL,-0.92,HIGH,Strong Sell from 52W peak — major breakdown with high conviction
+S26,mid_medvol,Strong Buy,BUY,0.88,HIGH,Standard Strong Buy — advancing sector + medium volatility
+S27,mid_medvol,Buy,BUY,0.70,HIGH,Standard Buy — clear conditions in medium volatility
+S28,mid_medvol,Neutral,HOLD,0.00,LOW,Standard neutral hold — no directional signal
+S29,mid_medvol,Sell,SELL,-0.70,HIGH,Standard Sell — bearish technical setup in medium volatility
+S30,mid_medvol,Strong Sell,SELL,-0.90,HIGH,Standard Strong Sell — high conviction bearish in medium vol
+S31,fallback,Strong Buy,BUY,0.80,HIGH,Fallback Strong Buy — unclassified context with strong technicals
+S32,fallback,Buy,BUY,0.65,HIGH,Fallback Buy — unclassified context with Buy rating
+S33,fallback,Neutral,HOLD,0.00,LOW,Fallback neutral — no signal in unclassified conditions
+S34,fallback,Sell,SELL,-0.65,MEDIUM,Fallback Sell — bearish rating in unclassified conditions
+S35,fallback,Strong Sell,SELL,-0.80,HIGH,Fallback Strong Sell — maximum bearish in unclassified conditions

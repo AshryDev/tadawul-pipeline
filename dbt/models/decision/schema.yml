@@ -1,51 +1,29 @@
 version: 2
 
 models:
-  - name: decision_cf_engine
-    description: >
-      Applies the Certainty Factor (CF) combination formula across all 8 technical
-      indicator votes to produce a single combined_cf per (symbol, date).
-      Implements Lecture 4 §4.10 — Certainty Factors.
-      Rule CFs are read from the knowledge_rules seed (the named Knowledge Base).
-    columns:
-      - name: symbol
-        tests: [not_null]
-      - name: date
-        tests: [not_null]
-      - name: combined_cf
-        description: "Final combined certainty factor (−1.0 to +1.0). Negative = sell conviction, positive = buy conviction."
-        tests: [not_null]
-      - name: cf_confidence
-        description: "HIGH if |combined_cf|≥0.65, MEDIUM if ≥0.40, LOW otherwise."
-        tests:
-          - not_null
-          - accepted_values:
-              values: ["HIGH", "MEDIUM", "LOW"]
-
-  - name: decision_metarule_flags
-    description: >
-      Evaluates three metarules per symbol per day (Lecture 4 §4.2 — Metarules).
-      M01: market-wide anomaly rate > 30% tightens BUY threshold.
-      M02: 3 consecutive down days blocks BUY.
-      G03: extreme volatility (> 80% ann.) blocks BUY.
-    columns:
-      - name: symbol
-        tests: [not_null]
-      - name: date
-        tests: [not_null]
-      - name: required_score_for_buy
-        description: "Minimum signal_score for a BUY. 3 normally; 6 when M01 fires."
-        tests: [not_null]
-      - name: active_metarules
-        description: "Space-separated list of fired metarule IDs (e.g. 'M01 G03'), or empty string."
-
   - name: decision_signals
     description: >
-      Final BUY / SELL / HOLD signal per symbol per day with full KBS-compliant
-      explanation facility (Lecture 4 §4.8–4.9: Why, Why Not, How trace).
-      Aggregates gold_technical_rating, gold_52w_levels, gold_volatility_index,
-      gold_anomaly_flags, gold_sector_performance, decision_cf_engine, and
-      decision_metarule_flags into one actionable row per (symbol, date).
+      Unified KBS decision layer — single output table per (symbol, date).
+
+      Reads all six gold models directly and applies the decision_table seed
+      (§4.7 Formal Logic) to produce BUY / SELL / HOLD signals with a formal
+      certainty factor (§4.10 Certainty Factors) on a −1.0 to +1.0 scale.
+
+      Knowledge representation:
+        §4.1  Production rules  — each row of decision_table.csv is an IF-THEN rule
+        §4.7  Decision tree     — signal_score → rating (5-branch CASE)
+        §4.7  Decision table    — dbt/seeds/decision_table.csv (the explicit KB)
+        §4.10 Certainty Factors — signal_cf column (−1.0 to +1.0) on every row
+
+      Explanation facility (§4.8–4.9):
+        why_signal      — Why this specific signal was produced (Dynamic)
+        why_not_buy     — Which condition blocked BUY, in priority order (Tracing)
+        why_not_sell    — Why SELL was not triggered (Tracing)
+        reasoning_trace — Numbered step-by-step How trace
+
+      Knowledge Acquisition interface (§6.9, §7.4):
+        Edit dbt/seeds/decision_table.csv → run dbt seed → run dbt run
+        No SQL knowledge required from the domain expert.
     columns:
       - name: symbol
         tests: [not_null]
@@ -54,48 +32,62 @@ models:
       - name: close
         tests: [not_null]
       - name: signal
-        description: "Actionable instruction: BUY, SELL, or HOLD."
+        description: "Actionable output: BUY, SELL, or HOLD."
         tests:
           - not_null
           - accepted_values:
               values: ["BUY", "SELL", "HOLD"]
+      - name: signal_cf
+        description: >
+          Certainty factor (§4.10) from the matched decision table row.
+          Scale: −1.0 (maximum SELL conviction) to +1.0 (maximum BUY conviction).
+          Near zero = uncertain / HOLD tendency.
+        tests: [not_null]
       - name: confidence
-        description: "Conviction level based on CF combination: HIGH / MEDIUM / LOW."
+        description: "Conviction tier derived from |signal_cf|: HIGH (≥0.65) / MEDIUM (≥0.40) / LOW (<0.40)."
         tests:
           - not_null
           - accepted_values:
               values: ["HIGH", "MEDIUM", "LOW"]
-      - name: explanation
-        description: "Backward-compatible summary string with rating, RSI, 52W levels, anomaly flags."
-        tests: [not_null]
+      - name: state_id
+        description: "Matched row in decision_table.csv (e.g. S05). NULL only on anomaly SELL override."
+      - name: rating
+        description: "Decision tree output: Strong Buy / Buy / Neutral / Sell / Strong Sell."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell"]
       - name: why_signal
-        description: "Why this specific signal was generated (§4.8 Why explanation)."
+        description: "Why this signal was produced — Dynamic explanation (§4.8)."
         tests: [not_null]
       - name: why_not_buy
-        description: "Which gate/rule blocked BUY. NULL when signal = BUY (§4.8 Why Not)."
+        description: "Which condition blocked BUY, in priority order. NULL when signal = BUY."
       - name: why_not_sell
-        description: "Why SELL was not triggered. NULL when signal = SELL (§4.8 Why Not)."
+        description: "Why SELL was not triggered. NULL when signal = SELL."
       - name: reasoning_trace
-        description: "Numbered step-by-step inference trace (§4.9 Tracing / How explanation)."
+        description: "Numbered step-by-step inference trace — How/Tracing explanation (§4.9)."
         tests: [not_null]
-      - name: combined_cf
-        description: "Combined certainty factor from decision_cf_engine (§4.10)."
-      - name: cf_confidence
-        description: "Confidence tier from CF formula: HIGH / MEDIUM / LOW."
+      - name: vol_level
+        description: "Volatility category used for decision table lookup: low / normal / high / extreme."
         tests:
+          - not_null
           - accepted_values:
-              values: ["HIGH", "MEDIUM", "LOW"]
-      - name: active_metarules
-        description: "Metarule IDs that fired today for this symbol."
-      - name: required_score_for_buy
-        description: "Minimum signal_score required for BUY (adjusted by M01 metarule)."
+              values: ["low", "normal", "high", "extreme"]
+      - name: at_52w_pos
+        description: "52-week position category: near_low / neutral / near_high."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["near_low", "neutral", "near_high"]
+      - name: sector_ok
+        description: "TRUE when sector advance ratio ≥ 50%."
+        tests: [not_null]
 
   - name: decision_case_outcomes
     description: >
       CBR case library — Retain step (Lecture 7 §7.8–7.10).
-      Shell model that defines the schema; rows are appended by the Airflow
-      DAG decision_cbr_outcomes. Stores resolved signal outcomes (WIN/LOSS)
-      for use by decision_cbr_lookup (Retrieve step).
+      Schema shell; rows written by the Airflow DAG decision_cbr_outcomes.
+      Stores resolved WIN/LOSS outcomes for future CBR lookup.
     columns:
       - name: symbol
         tests: [not_null]
@@ -106,40 +98,21 @@ models:
           - accepted_values:
               values: ["BUY", "SELL", "HOLD"]
       - name: outcome
-        description: "WIN or LOSS based on forward return vs signal direction."
+        description: "WIN or LOSS based on 5-day forward return vs signal direction."
         tests:
           - accepted_values:
               values: ["WIN", "LOSS"]
+      - name: signal_cf
+        description: "Certainty factor from decision_signals at the time of the signal (−1.0 to +1.0)."
       - name: return_5d
-        description: "5-day forward return: (close_t+5 - close_t) / close_t."
+        description: "5-day forward return: (close_t+5 − close_t) / close_t."
       - name: return_20d
-        description: "20-day forward return: (close_t+20 - close_t) / close_t."
-
-  - name: decision_cbr_lookup
-    description: >
-      CBR Retrieve and Reuse steps (Lecture 7 §7.8–7.10). For each current
-      (symbol, date), finds historically similar market situations using 5-bin
-      feature matching (vol, RSI, 52W position, sector momentum, signal score)
-      and reports aggregate win rates and returns from similar past cases.
-    columns:
-      - name: symbol
-        tests: [not_null]
-      - name: date
-        tests: [not_null]
-      - name: similar_cases_count
-        description: "Number of historical cases with ≥ 3 matching feature bins."
-      - name: cbr_win_rate
-        description: "Fraction of similar cases where the signal outcome was WIN."
-      - name: cbr_avg_return_5d
-        description: "Average 5-day return across similar historical cases."
-      - name: cbr_note
-        description: "Human-readable CBR summary, or 'Insufficient history' message."
+        description: "20-day forward return: (close_t+20 − close_t) / close_t."
 
   - name: decision_validation
     description: >
       Signal accuracy and reliability metrics per month, signal type, and sector.
-      Implements Lecture 4 §4.11–4.12 — Evaluation, Validation, and Verification.
-      Measures: Accuracy, Reliability, Sensitivity (signals near decision boundary).
+      Implements §4.11–4.12 — Evaluation, Validation, and Verification.
       Populated once decision_case_outcomes has data from the CBR DAG.
     columns:
       - name: month
@@ -156,4 +129,4 @@ models:
       - name: reliability
         description: "Fraction of predictions empirically correct (§4.12 Reliability)."
       - name: threshold_sensitive_count
-        description: "Signals near the CF decision boundary (|CF| 0.35–0.45) — §4.12 Sensitivity."
+        description: "Signals near the CF boundary (|signal_cf| 0.35–0.45) — §4.12 Sensitivity."

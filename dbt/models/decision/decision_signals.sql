@@ -9,62 +9,54 @@
 }}
 
 /*
-  decision_signals
-  ─────────────────
-  Final BUY / SELL / HOLD signal per symbol per day with full KBS-compliant
-  explanation facility (Lecture 4 §4.8–4.9 — Why / Why Not / How).
+  decision_signals — unified KBS decision layer
+  ─────────────────────────────────────────────
+  Single output table for the entire decision layer. Reads all six gold models
+  directly and applies the decision table seed to produce BUY / SELL / HOLD
+  signals with a formal certainty factor (§4.10) on a −1.0 to +1.0 scale.
 
-  Aggregates five gold-layer models plus the CF engine and metarule flags
-  from the decision layer.
+  Knowledge representation used (Lecture 4):
+    §4.1  Production rules    — each row of decision_table.csv is an IF-THEN rule
+    §4.7  Decision tree       — signal_score → rating classification (5-branch CASE)
+    §4.7  Decision table      — dbt/seeds/decision_table.csv (the explicit KB)
+    §4.10 Certainty Factors   — signal_cf column (−1.0 to +1.0) on every row
 
-  Signal logic (evaluated in order):
-    BUY   — technical rating is Buy or Strong Buy
-            AND no price-IQR anomaly (gate G01)
-            AND sector advance ratio ≥ 50% (gate G02)
-            AND signal_score ≥ required_score_for_buy (3 normally; 6 when M01 fires)
-            AND annualised vol ≤ 80% (gate G03)
-            AND no 3-consecutive-down-day streak (metarule M02)
-    SELL  — technical rating is Sell or Strong Sell
-            OR price anomaly fires AND signal_score < 0
-    HOLD  — all other cases
+  Inference mechanism:
+    1. Classify each (symbol, date) into categorical dimensions
+       (rating, vol_level, at_52w_pos, sector_ok, has_anomaly)
+    2. Join against decision_table seed — most specific matching row wins
+       (specificity_score = count of non-'any' conditions)
+    3. Apply anomaly SELL override: price anomaly + signal_score < 0 → SELL (CF=−0.50)
+    4. Generate explanation facility columns (§4.8 Why / Why Not / How)
 
-  Confidence reflects the CF combination formula (§4.10):
-    HIGH   — |combined_cf| ≥ 0.65
-    MEDIUM — |combined_cf| ≥ 0.40
-    LOW    — |combined_cf| < 0.40
-
-  Explanation columns (§4.8 Why / Why Not / How):
-    why_signal      — Why was THIS specific signal generated
-    why_not_buy     — Which gate/rule blocked BUY (NULL if signal = BUY)
-    why_not_sell    — Why SELL was not triggered (NULL if signal = SELL)
-    reasoning_trace — Numbered step-by-step How trace of the inference path
+  Knowledge Acquisition interface (§6.9, §7.4):
+    Edit dbt/seeds/decision_table.csv and run:
+    docker exec dbt dbt seed --select decision_table --project-dir /usr/dbt --profiles-dir /root/.dbt
+    docker exec dbt dbt run  --select decision_signals --project-dir /usr/dbt --profiles-dir /root/.dbt
 */
 
 WITH
+
+-- ── 1. Gold layer inputs ──────────────────────────────────────────────────────
+
 tech AS (
     SELECT
         symbol, company_name, sector, market_cap_tier,
         date, close, volume,
-        sma50, sma200, rsi14, bb_lower, bb_upper,
-        signal_score, buy_signals, sell_signals, neutral_signals, rating
+        signal_score, buy_signals, sell_signals, neutral_signals,
+        sma50, sma200, rsi14, bb_lower, bb_upper
     FROM {{ ref('gold_technical_rating') }}
-
     {% if is_incremental() %}
     WHERE date > (SELECT MAX(date) FROM {{ this }})
     {% endif %}
 ),
 
-levels AS (
-    SELECT symbol, date, high_52w, low_52w, pct_from_high, pct_from_low, at_52w_high, at_52w_low
-    FROM {{ ref('gold_52w_levels') }}
-),
-
 vol AS (
-    SELECT symbol, date, annualized_vol
+    SELECT symbol, date, annualized_vol, log_return
     FROM {{ ref('gold_volatility_index') }}
 ),
 
-anomalies AS (
+anom AS (
     SELECT
         symbol, date,
         MAX(CASE WHEN anomaly_type = 'price_iqr'     AND is_anomaly THEN TRUE ELSE FALSE END) AS has_price_anomaly,
@@ -73,186 +65,216 @@ anomalies AS (
     GROUP BY symbol, date
 ),
 
-sector_perf AS (
-    SELECT sector, date,
-           avg_daily_return  AS sector_avg_return,
-           advance_ratio     AS sector_advance_ratio
+lev AS (
+    SELECT symbol, date, high_52w, low_52w, pct_from_high, pct_from_low,
+           at_52w_high, at_52w_low
+    FROM {{ ref('gold_52w_levels') }}
+),
+
+sect AS (
+    SELECT sector, date, advance_ratio AS sector_advance_ratio
     FROM {{ ref('gold_sector_performance') }}
 ),
 
-cf AS (
-    SELECT symbol, date, combined_cf, cf_confidence, cf_buy_strength, cf_sell_strength
-    FROM {{ ref('decision_cf_engine') }}
+vwap AS (
+    SELECT symbol, date, session_vwap
+    FROM {{ ref('gold_intraday_vwap') }}
 ),
 
-metarules AS (
-    SELECT symbol, date,
-           m01_tighten_buy, m02_consecutive_down, g03_extreme_volatility,
-           active_metarules, required_score_for_buy
-    FROM {{ ref('decision_metarule_flags') }}
-),
+-- ── 2. Classify inputs for decision table lookup ──────────────────────────────
 
-joined AS (
+classified AS (
     SELECT
         t.symbol, t.company_name, t.sector, t.market_cap_tier,
         t.date, t.close, t.volume,
+        t.signal_score, t.buy_signals, t.sell_signals, t.neutral_signals,
         t.sma50, t.sma200, t.rsi14, t.bb_lower, t.bb_upper,
-        t.signal_score, t.buy_signals, t.sell_signals, t.neutral_signals, t.rating,
-        l.high_52w, l.low_52w, l.pct_from_high, l.pct_from_low,
-        COALESCE(l.at_52w_high,               FALSE) AS at_52w_high,
-        COALESCE(l.at_52w_low,                FALSE) AS at_52w_low,
-        v.annualized_vol,
-        COALESCE(a.has_price_anomaly,         FALSE) AS has_price_anomaly,
-        COALESCE(a.has_volume_anomaly,        FALSE) AS has_volume_anomaly,
-        sp.sector_avg_return,
-        sp.sector_advance_ratio,
-        COALESCE(cf.combined_cf,              0.0)   AS combined_cf,
-        COALESCE(cf.cf_confidence,            'LOW') AS cf_confidence,
-        COALESCE(cf.cf_buy_strength,          0.0)   AS cf_buy_strength,
-        COALESCE(cf.cf_sell_strength,         0.0)   AS cf_sell_strength,
-        COALESCE(mr.active_metarules,         '')    AS active_metarules,
-        COALESCE(mr.required_score_for_buy,   3)     AS required_score_for_buy,
-        COALESCE(mr.m01_tighten_buy,          FALSE) AS m01_tighten_buy,
-        COALESCE(mr.m02_consecutive_down,     FALSE) AS m02_consecutive_down,
-        COALESCE(mr.g03_extreme_volatility,   FALSE) AS g03_extreme_volatility
+
+        COALESCE(v.annualized_vol,       0.0)   AS annualized_vol,
+        COALESCE(v.log_return,           0.0)   AS log_return,
+        COALESCE(a.has_price_anomaly,    FALSE)  AS has_price_anomaly,
+        COALESCE(a.has_volume_anomaly,   FALSE)  AS has_volume_anomaly,
+
+        l.high_52w, l.low_52w,
+        l.pct_from_high, l.pct_from_low,
+        COALESCE(l.at_52w_high, FALSE)           AS at_52w_high,
+        COALESCE(l.at_52w_low,  FALSE)           AS at_52w_low,
+
+        COALESCE(s.sector_advance_ratio, 0.5)   AS sector_advance_ratio,
+        w.session_vwap,
+
+        -- ── Decision tree: signal_score → rating (§4.7 Formal Logic) ─────────
+        -- Five branches mapping the raw score to a categorical label
+        CASE
+            WHEN t.signal_score >=  5 THEN 'Strong Buy'
+            WHEN t.signal_score >=  3 THEN 'Buy'
+            WHEN t.signal_score <= -5 THEN 'Strong Sell'
+            WHEN t.signal_score <= -3 THEN 'Sell'
+            ELSE                           'Neutral'
+        END AS rating,
+
+        -- ── Categorical dimension: volatility level ───────────────────────────
+        CASE
+            WHEN COALESCE(v.annualized_vol, 0.0) > 0.80 THEN 'extreme'
+            WHEN COALESCE(v.annualized_vol, 0.0) > 0.50 THEN 'high'
+            WHEN COALESCE(v.annualized_vol, 0.0) > 0.20 THEN 'normal'
+            ELSE                                              'low'
+        END AS vol_level,
+
+        -- ── Categorical dimension: 52-week position ───────────────────────────
+        CASE
+            WHEN COALESCE(l.at_52w_low,  FALSE) THEN 'near_low'
+            WHEN COALESCE(l.at_52w_high, FALSE) THEN 'near_high'
+            ELSE                                     'neutral'
+        END AS at_52w_pos,
+
+        -- ── Boolean: sector advancing ─────────────────────────────────────────
+        (COALESCE(s.sector_advance_ratio, 0.5) >= 0.5) AS sector_ok
+
     FROM tech             AS t
-    LEFT JOIN levels      AS l  ON t.symbol = l.symbol  AND t.date = l.date
-    LEFT JOIN vol         AS v  ON t.symbol = v.symbol  AND t.date = v.date
-    LEFT JOIN anomalies   AS a  ON t.symbol = a.symbol  AND t.date = a.date
-    LEFT JOIN sector_perf AS sp ON t.sector  = sp.sector AND t.date = sp.date
-    LEFT JOIN cf          AS cf ON t.symbol = cf.symbol  AND t.date = cf.date
-    LEFT JOIN metarules   AS mr ON t.symbol = mr.symbol  AND t.date = mr.date
+    LEFT JOIN vol         AS v  ON t.symbol  = v.symbol  AND t.date = v.date
+    LEFT JOIN anom        AS a  ON t.symbol  = a.symbol  AND t.date = a.date
+    LEFT JOIN lev         AS l  ON t.symbol  = l.symbol  AND t.date = l.date
+    LEFT JOIN sect        AS s  ON t.sector  = s.sector  AND t.date = s.date
+    LEFT JOIN vwap        AS w  ON t.symbol  = w.symbol  AND t.date = w.date
 ),
+
+-- ── 3. Classify inputs into a single condition_group (row dimension) ─────────
+-- Priority order: anomaly/vol risk first, then sector context, then 52W position
+
+classified_with_group AS (
+    SELECT
+        *,
+        CASE
+            WHEN has_price_anomaly OR vol_level IN ('high', 'extreme') THEN 'anomaly_highvol'
+            WHEN NOT sector_ok                                          THEN 'sector_weak'
+            WHEN at_52w_pos = 'near_low'                               THEN 'near_52w_low'
+            WHEN at_52w_pos = 'near_high'                              THEN 'near_52w_high'
+            WHEN vol_level = 'low'                                     THEN 'sector_ok_lowvol'
+            WHEN vol_level = 'normal'                                  THEN 'mid_medvol'
+            ELSE                                                            'fallback'
+        END AS condition_group
+    FROM classified
+),
+
+-- ── 4. Decision table (§4.7 Formal Logic + §4.10 Certainty Factors) ──────────
+-- 7 × 5 symmetric grid — exact 2-key join on (condition_group, rating_group)
+
+dt AS (
+    SELECT * FROM {{ ref('decision_table') }}
+),
+
+matched AS (
+    SELECT
+        c.*,
+        d.state_id,
+        d.signal        AS dt_signal,
+        d.signal_cf     AS dt_signal_cf,
+        d.confidence    AS dt_confidence,
+        d.description   AS dt_description
+    FROM classified_with_group AS c
+    LEFT JOIN dt AS d
+        ON d.condition_group = c.condition_group
+       AND d.rating_group    = c.rating
+),
+
+-- ── 5. Apply anomaly SELL override ────────────────────────────────────────────
+-- Price-IQR anomaly firing alongside a negative signal_score overrides the
+-- decision table and forces SELL (CF = −0.50) — anomaly path from §4.1.
 
 with_signal AS (
     SELECT
         *,
-
-        -- ── Signal (production rules with metarule overrides) ─────────────────
         CASE
-            WHEN rating IN ('Strong Buy', 'Buy')
-             AND NOT has_price_anomaly
-             AND COALESCE(sector_advance_ratio, 0.5) >= 0.5
-             AND signal_score >= required_score_for_buy
-             AND NOT g03_extreme_volatility
-             AND NOT m02_consecutive_down
-            THEN 'BUY'
-
-            WHEN rating IN ('Strong Sell', 'Sell')
-              OR (has_price_anomaly AND signal_score < 0)
-            THEN 'SELL'
-
-            ELSE 'HOLD'
+            WHEN has_price_anomaly AND rating = 'Neutral' AND signal_score < 0 THEN 'SELL'
+            ELSE dt_signal
         END AS signal,
 
-        -- ── Confidence (from CF combination formula §4.10) ────────────────────
         CASE
-            WHEN ABS(combined_cf) >= 0.65 THEN 'HIGH'
-            WHEN ABS(combined_cf) >= 0.40 THEN 'MEDIUM'
-            ELSE                               'LOW'
-        END AS confidence
+            WHEN has_price_anomaly AND rating = 'Neutral' AND signal_score < 0 THEN -0.50
+            ELSE dt_signal_cf
+        END AS signal_cf,
 
-    FROM joined
+        CASE
+            WHEN has_price_anomaly AND rating = 'Neutral' AND signal_score < 0 THEN 'MEDIUM'
+            ELSE dt_confidence
+        END AS confidence
+    FROM matched
 ),
 
--- ── Explanation facility (§4.8: Why / Why Not / How) ─────────────────────────
-with_explanations AS (
+-- ── 6. Explanation facility (§4.8 Why / Why Not / How) ───────────────────────
+
+with_explanation AS (
     SELECT
         *,
 
-        -- WHY: why the given signal was produced
-        CASE signal
-            WHEN 'BUY' THEN CONCAT(
-                'BUY: ', rating, ' rating (CF=', CAST(ROUND(combined_cf, 2) AS VARCHAR),
-                ', score=+', CAST(signal_score AS VARCHAR), '/8)',
-                ' + no price anomaly + sector advance=',
-                CAST(ROUND(COALESCE(sector_advance_ratio, 0) * 100, 0) AS VARCHAR), '%'
-            )
-            WHEN 'SELL' THEN
-                CASE
-                    WHEN rating IN ('Strong Sell', 'Sell') AND has_price_anomaly
-                    THEN CONCAT('SELL: ', rating, ' rating (score=', CAST(signal_score AS VARCHAR), '/8) + price anomaly confirmed')
-                    WHEN rating IN ('Strong Sell', 'Sell')
-                    THEN CONCAT('SELL: ', rating, ' rating (score=', CAST(signal_score AS VARCHAR), '/8)')
-                    ELSE CONCAT('SELL: price-IQR anomaly with negative signal score (', CAST(signal_score AS VARCHAR), ')')
-                END
-            ELSE CONCAT(
-                'HOLD: ', rating, ' rating (CF=', CAST(ROUND(combined_cf, 2) AS VARCHAR),
-                ', score=', CAST(signal_score AS VARCHAR), '/8) — insufficient conditions for BUY or SELL'
-            )
-        END AS why_signal,
+        -- WHY: why this signal was produced (Dynamic explanation §4.9)
+        CONCAT(
+            signal,
+            ' (CF=', CAST(ROUND(signal_cf, 2) AS VARCHAR),
+            ', ', confidence, '): ',
+            'state=', COALESCE(state_id, 'override'),
+            ' — ',
+            CASE
+                WHEN has_price_anomaly AND rating = 'Neutral' AND signal_score < 0
+                THEN 'price-IQR anomaly with negative signal score (' || CAST(signal_score AS VARCHAR) || ') — Neutral rating breakdown'
+                ELSE COALESCE(dt_description, 'no description')
+            END
+        ) AS why_signal,
 
-        -- WHY NOT BUY: first failing gate (NULL when signal = BUY)
+        -- WHY NOT BUY: first condition that blocked BUY (NULL when signal = BUY)
         CASE
             WHEN signal = 'BUY' THEN NULL
-            WHEN NOT (rating IN ('Strong Buy', 'Buy'))
+            WHEN rating NOT IN ('Strong Buy', 'Buy')
             THEN CONCAT(
-                'BUY not triggered: rating is ''', rating,
-                ''' (score=', CAST(signal_score AS VARCHAR), '/8, requires Buy or Strong Buy)'
+                'Rating is ''', rating,
+                ''' (score=', CAST(signal_score AS VARCHAR), '/8) — not eligible for BUY'
             )
             WHEN has_price_anomaly
-            THEN 'BUY blocked by gate G01: price-IQR anomaly detected'
-            WHEN COALESCE(sector_advance_ratio, 0.5) < 0.5
             THEN CONCAT(
-                'BUY blocked by gate G02: sector advance ',
-                CAST(ROUND(COALESCE(sector_advance_ratio, 0) * 100, 0) AS VARCHAR),
+                'Price-IQR anomaly detected — spike entry risk (state ', COALESCE(state_id, '?'), ')'
+            )
+            WHEN NOT sector_ok
+            THEN CONCAT(
+                'Sector advancing ', CAST(ROUND(sector_advance_ratio * 100, 0) AS VARCHAR),
                 '% < 50% threshold'
             )
-            WHEN signal_score < required_score_for_buy
+            WHEN vol_level IN ('extreme', 'high')
             THEN CONCAT(
-                'BUY blocked by metarule M01: market-wide anomaly rate >30% requires score≥',
-                CAST(required_score_for_buy AS VARCHAR),
-                ', current score=', CAST(signal_score AS VARCHAR)
+                vol_level, ' volatility (',
+                CAST(ROUND(annualized_vol * 100, 1) AS VARCHAR), '% ann.) — position risk'
             )
-            WHEN g03_extreme_volatility
-            THEN CONCAT(
-                'BUY blocked by gate G03: extreme volatility (',
-                CAST(ROUND(COALESCE(annualized_vol, 0) * 100, 1) AS VARCHAR), '% ann.)'
+            ELSE CONCAT(
+                'Decision table state ', COALESCE(state_id, '?'), ' maps to ', signal
             )
-            WHEN m02_consecutive_down
-            THEN 'BUY blocked by metarule M02: 3 consecutive down days (sustained selling pressure)'
-            ELSE 'BUY not triggered'
         END AS why_not_buy,
 
-        -- WHY NOT SELL: why SELL was not triggered (NULL when signal = SELL)
+        -- WHY NOT SELL (NULL when signal = SELL)
         CASE
             WHEN signal = 'SELL' THEN NULL
-            WHEN NOT (rating IN ('Strong Sell', 'Sell')) AND NOT has_price_anomaly
-            THEN CONCAT(
-                'SELL not triggered: rating is ''', rating, ''' and no price anomaly'
-            )
-            WHEN NOT (rating IN ('Strong Sell', 'Sell')) AND has_price_anomaly AND signal_score >= 0
-            THEN CONCAT(
-                'SELL not triggered: price anomaly present but signal_score=',
-                CAST(signal_score AS VARCHAR), ' is non-negative (anomaly SELL requires score < 0)'
-            )
-            WHEN NOT (rating IN ('Strong Sell', 'Sell'))
-            THEN CONCAT(
-                'SELL not triggered: rating is ''', rating,
-                ''' (score=', CAST(signal_score AS VARCHAR), ')'
-            )
+            WHEN NOT (rating IN ('Sell', 'Strong Sell'))
+             AND NOT (has_price_anomaly AND rating = 'Neutral' AND signal_score < 0)
+            THEN CONCAT('Rating is ''', rating, ''' and no triggering anomaly')
             ELSE 'SELL not triggered'
         END AS why_not_sell,
 
-        -- HOW: numbered step-by-step reasoning trace (§4.9 Tracing)
+        -- HOW: numbered step-by-step inference trace (Tracing §4.9)
         CONCAT(
-            '1. CF engine: combined_cf=', CAST(ROUND(combined_cf, 2) AS VARCHAR),
-            ' → ', CASE
-                WHEN combined_cf >= 0.40  THEN 'BUY direction'
-                WHEN combined_cf <= -0.40 THEN 'SELL direction'
-                ELSE 'neutral'
-            END, '. ',
-            '2. Anomaly gate (G01): has_price_anomaly=', CAST(has_price_anomaly AS VARCHAR), '. ',
-            '3. Sector gate (G02): advance_ratio=',
-            CAST(ROUND(COALESCE(sector_advance_ratio, 0) * 100, 0) AS VARCHAR), '%',
-            CASE WHEN COALESCE(sector_advance_ratio, 0.5) >= 0.5 THEN ' [passed]' ELSE ' [BLOCKED]' END, '. ',
-            '4. Metarules: ',
-            CASE WHEN active_metarules = '' THEN 'none' ELSE active_metarules END, '. ',
-            '5. Final: ',
-            CASE signal
-                WHEN 'BUY'  THEN CONCAT('BUY (', rating, ')')
-                WHEN 'SELL' THEN CONCAT('SELL (', rating, ')')
-                ELSE 'HOLD'
+            '1. Inputs classified: rating=', rating,
+            ', score=', CAST(signal_score AS VARCHAR), '/8',
+            ', vol=', vol_level,
+            ', 52W=', at_52w_pos,
+            ', anomaly=', CAST(has_price_anomaly AS VARCHAR),
+            ', sector_ok=', CAST(sector_ok AS VARCHAR), '. ',
+            '2. Decision table matched: state=', COALESCE(state_id, 'fallback'),
+            ' (condition_group=', COALESCE(condition_group, '?'), '). ',
+            '3. Signal=', signal,
+            ', CF=', CAST(ROUND(signal_cf, 2) AS VARCHAR),
+            ' (', confidence, ').',
+            CASE
+                WHEN has_price_anomaly AND rating = 'Neutral' AND signal_score < 0
+                THEN ' [anomaly SELL override applied]'
+                ELSE ''
             END
         ) AS reasoning_trace
 
@@ -260,72 +282,53 @@ with_explanations AS (
 )
 
 SELECT
-    symbol,
-    company_name,
-    sector,
-    market_cap_tier,
-    date,
-    close,
+    -- ── Identity ──────────────────────────────────────────────────────────────
+    symbol, company_name, sector, market_cap_tier, date, close, volume,
+
+    -- ── Signal output (§4.10 uncertainty on −1.0 to +1.0 scale) ─────────────
     signal,
+    ROUND(signal_cf, 4)         AS signal_cf,
     confidence,
+    state_id,
 
-    -- ── Summary explanation (backward-compatible) ─────────────────────────────
-    CONCAT(
-        'Rating: ', rating,
-        ' (score=', CAST(signal_score AS VARCHAR), '/8',
-        ', buy=',   CAST(buy_signals  AS VARCHAR),
-        ', sell=',  CAST(sell_signals AS VARCHAR), ')',
-        CASE WHEN rsi14 IS NOT NULL
-             THEN CONCAT('; RSI(14)=', CAST(ROUND(rsi14, 1) AS VARCHAR)) ELSE '' END,
-        CASE WHEN at_52w_high
-             THEN CONCAT('; near 52W high (',
-                         CAST(ROUND(ABS(pct_from_high) * 100, 1) AS VARCHAR), '% below)') ELSE '' END,
-        CASE WHEN at_52w_low
-             THEN CONCAT('; near 52W low (+',
-                         CAST(ROUND(pct_from_low * 100, 1) AS VARCHAR), '% above)') ELSE '' END,
-        CASE WHEN has_price_anomaly  THEN '; price anomaly'  ELSE '' END,
-        CASE WHEN has_volume_anomaly THEN '; unusual volume' ELSE '' END,
-        CASE WHEN COALESCE(annualized_vol, 0.0) > 0.5
-             THEN CONCAT('; high vol (', CAST(ROUND(annualized_vol * 100, 1) AS VARCHAR), '% ann.)') ELSE '' END,
-        CASE WHEN sector_advance_ratio IS NOT NULL
-             THEN CONCAT('; sector advance=', CAST(ROUND(sector_advance_ratio * 100, 0) AS VARCHAR), '%') ELSE '' END
-    ) AS explanation,
-
-    -- ── KBS explanation facility (§4.8–4.9) ──────────────────────────────────
+    -- ── Explanation facility (§4.8) ───────────────────────────────────────────
     why_signal,
     why_not_buy,
     why_not_sell,
     reasoning_trace,
 
-    -- ── CF engine output (§4.10) ──────────────────────────────────────────────
-    ROUND(combined_cf,      4) AS combined_cf,
-    cf_confidence,
-    ROUND(cf_buy_strength,  4) AS cf_buy_strength,
-    ROUND(cf_sell_strength, 4) AS cf_sell_strength,
+    -- ── Technical rating ──────────────────────────────────────────────────────
+    rating,
+    signal_score,
+    buy_signals, sell_signals, neutral_signals,
+    ROUND(rsi14,    2)          AS rsi14,
+    ROUND(sma50,    4)          AS sma50,
+    ROUND(sma200,   4)          AS sma200,
+    ROUND(bb_lower, 4)          AS bb_lower,
+    ROUND(bb_upper, 4)          AS bb_upper,
 
-    -- ── Metarule state ────────────────────────────────────────────────────────
-    active_metarules,
-    required_score_for_buy,
+    -- ── Volatility ────────────────────────────────────────────────────────────
+    ROUND(annualized_vol, 4)    AS annualized_vol,
+    vol_level,
 
-    -- ── Technical metrics ─────────────────────────────────────────────────────
-    signal_score, buy_signals, sell_signals, neutral_signals, rating,
-    ROUND(rsi14,    2) AS rsi14,
-    ROUND(sma50,    4) AS sma50,
-    ROUND(sma200,   4) AS sma200,
-    ROUND(bb_lower, 4) AS bb_lower,
-    ROUND(bb_upper, 4) AS bb_upper,
+    -- ── 52-week levels ────────────────────────────────────────────────────────
     high_52w, low_52w,
-    ROUND(pct_from_high,  4) AS pct_from_high,
-    ROUND(pct_from_low,   4) AS pct_from_low,
-    at_52w_high, at_52w_low,
-    ROUND(annualized_vol, 4) AS annualized_vol,
+    ROUND(pct_from_high, 4)     AS pct_from_high,
+    ROUND(pct_from_low,  4)     AS pct_from_low,
+    at_52w_high, at_52w_low, at_52w_pos,
+
+    -- ── Anomaly flags ─────────────────────────────────────────────────────────
     has_price_anomaly,
     has_volume_anomaly,
-    ROUND(sector_avg_return,    6) AS sector_avg_return,
+
+    -- ── Sector & VWAP ─────────────────────────────────────────────────────────
     ROUND(sector_advance_ratio, 4) AS sector_advance_ratio,
+    sector_ok,
+    session_vwap,
+
     CURRENT_TIMESTAMP               AS dbt_updated_at
 
-FROM with_explanations
+FROM with_explanation
 
 {% if is_incremental() %}
 WHERE date > (SELECT MAX(date) FROM {{ this }})

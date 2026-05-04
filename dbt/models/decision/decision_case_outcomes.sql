@@ -30,7 +30,7 @@ SELECT
     CAST(NULL AS VARCHAR)   AS symbol,
     CAST(NULL AS VARCHAR)   AS signal_date,
     CAST(NULL AS VARCHAR)   AS signal,
-    CAST(NULL AS DOUBLE)    AS combined_cf,
+    CAST(NULL AS DOUBLE)    AS signal_cf,
     CAST(NULL AS INTEGER)   AS signal_score,
     CAST(NULL AS VARCHAR)   AS sector,
     CAST(NULL AS DOUBLE)    AS close_at_signal,

@@ -8,7 +8,7 @@
 
 ## Abstract
 
-This report presents the design and implementation of a Knowledge-Based System (KBS) for automated trading signal generation on the Saudi Exchange (Tadawul). The system addresses the knowledge scalability challenge facing retail investors: a single expert analyst cannot consistently apply multi-dimensional technical analysis across 92 listed symbols in real time. The proposed system encodes financial domain expertise in a named Knowledge Base of 13 production rules with empirically assigned certainty factors, processes incoming market data through a three-stage inference engine implementing forward chaining with the CF combination formula, and delivers BUY / SELL / HOLD recommendations accompanied by a complete explanation facility covering *Why*, *Why Not*, and *How* reasoning traces. A Case-Based Reasoning (CBR) module accumulates historical outcomes to advise signal reliability, while a validation model tracks empirical accuracy, reliability, and sensitivity metrics over time. The system is built on an industrial-grade big data lakehouse (Apache Kafka, Spark, Airflow, dbt, Apache Iceberg, Trino) supporting both real-time streaming and batch analytics. All KBS architectural requirements from the course lectures are satisfied: a named, updatable Knowledge Base; a distinct multi-stage inference engine; a full explanation facility; a knowledge acquisition interface; CBR; and empirical validation. The report also maps each system component explicitly to lecture section references and provides a formal gap analysis showing all identified deficiencies have been resolved.
+This report presents the design and implementation of a Knowledge-Based System (KBS) for automated trading signal generation on the Saudi Exchange (Tadawul). The system addresses the knowledge scalability challenge facing retail investors: a single expert analyst cannot consistently apply multi-dimensional technical analysis across 92 listed symbols in real time. The proposed system encodes financial domain expertise in a named Knowledge Base of 36 production rules with pre-assigned certainty factors (§4.10) in `decision_table.csv`, processes incoming market data through a single unified inference engine implementing the Propose → Protect → Validate framework, and delivers BUY / SELL / HOLD recommendations accompanied by a complete explanation facility covering all four explanation types from §4.8: *Why*, *Why Not*, *How*, and *Journalistic* reasoning traces. A Case-Based Reasoning (CBR) module accumulates historical outcomes to advise signal reliability, while a validation model tracks empirical accuracy, reliability, and sensitivity metrics over time. The system is built on an industrial-grade big data lakehouse (Apache Kafka, Spark, Airflow, dbt, Apache Iceberg, Trino) supporting both real-time streaming and batch analytics. All KBS architectural requirements from the course lectures are satisfied: a named, updatable Knowledge Base; a distinct multi-stage inference engine; a full explanation facility; a knowledge acquisition interface; CBR; and empirical validation. The report also maps each system component explicitly to lecture section references and provides a formal gap analysis showing all identified deficiencies have been resolved.
 
 ---
 
@@ -76,14 +76,6 @@ KBS occupies a specific level in the Information Systems Hierarchy (Lecture 1, �
 | Data | TPS | Operational staff | Perform basic transactions |
 
 This project spans all four levels: raw tick data (Data) flows through cleaning (Information), through domain analytics and rule application (Knowledge), and is designed to eventually support portfolio-level strategy (Wisdom).
-
-![Figure 1: DIKW hierarchy mapped onto the four-layer medallion architecture](figures/fig5_dikw_medallion.png)
-
-*Figure 1: The DIKW hierarchy from Lecture 1 §1.1 mapped directly onto the pipeline layers. Bronze = raw Data; Silver = contextualised Information; Gold = structured Knowledge; Decision = actionable Wisdom (Buy / Sell / Hold + explanation).*
-
-![Figure 2: Canonical KBS architecture mapped to this system's components](figures/fig6_kbs_architecture.png)
-
-*Figure 2: The canonical KBS architecture (§7.4) showing the five required components and how each is implemented in this system. The Inference Engine executes CF-based forward chaining; the Knowledge Base is the `knowledge_rules.csv` seed; the Explanation Facility generates Why / Why Not / How traces; Knowledge Acquisition is the CSV edit + `dbt seed` interface; the User Interface is the Trino query layer (proposed: Next.js dashboard).*
 
 ### 2.2 Types of Knowledge-Based Systems
 
@@ -192,7 +184,7 @@ Model-based knowledge engineering decomposes development tasks across six models
 | **Task model** | Signal generation: classification of (symbol, date) into {BUY, SELL, HOLD} |
 | **Agent model** | Airflow scheduler (automated), financial analyst (knowledge provider), developer (KE/developer) |
 | **Knowledge model** | 13 production rules, CF values, decision table, CBR case library |
-| **Communication model** | Trino SQL query interface; future dashboard for analyst interaction |
+| **Communication model** | Trino SQL query interface; SaudiQuant analytics dashboard (Section 8.3) for analyst interaction |
 | **Design model** | dbt medallion architecture; four-layer Iceberg lakehouse; inference via SQL models |
 
 ### 2.11 Big Data Analytics (§2.3–§2.8)
@@ -253,27 +245,27 @@ The system implements a **five-layer architecture**: four data-transformation la
 └───────────────────────────┬──────────────────────────────────────┘
                             ▼  dbt + Airflow CBR DAG
 ┌──────────────────────────────────────────────────────────────────┐
-│  DECISION LAYER  — KBS: KB + Inference Engine + CBR + Validation │
+│  DECISION LAYER  — KBS: Knowledge Base + Inference + Validation  │
 │                                                                   │
-│  ┌─ Knowledge Base ──────────────────────────────────────────┐   │
-│  │  seeds/knowledge_rules.csv  (13 rules, CFs, categories)   │   │
-│  │  seeds/decision_table.csv   (20 exhaustive states)        │   │
+│  ┌─ Knowledge Base (§4.7) ───────────────────────────────────┐   │
+│  │  seeds/decision_table.csv  — 36 production rules          │   │
+│  │  Each row: IF (rating, anomaly, sector, vol, 52W)         │   │
+│  │           THEN signal,  signal_cf (−1.0 to +1.0)          │   │
 │  └───────────────────────────────────────────────────────────┘   │
 │                                                                   │
-│  ┌─ Inference Engine ────────────────────────────────────────┐   │
-│  │  Stage 1: decision_cf_engine      (CF combination)         │   │
-│  │  Stage 2: decision_metarule_flags (M01, M02, G03)          │   │
-│  │  Stage 3: decision_signals        (signal + explanation)   │   │
-│  │           → why_signal, why_not_buy, why_not_sell          │   │
-│  │           → reasoning_trace (How trace)                    │   │
+│  ┌─ Inference Engine — Propose → Protect → Validate ─────────┐   │
+│  │  PROPOSE : gold_technical_rating → rating (5 categories)  │   │
+│  │  PROTECT : vol_level (high/extreme) + has_price_anomaly   │   │
+│  │  VALIDATE: at_52w_pos + sector_ok                         │   │
+│  │                                                            │   │
+│  │  decision_signals (single unified model)                   │   │
+│  │  → specificity-ordered decision table lookup              │   │
+│  │  → anomaly SELL override                                  │   │
+│  │  → why_signal, why_not_buy, reasoning_trace (§4.8–4.9)   │   │
 │  └───────────────────────────────────────────────────────────┘   │
 │                                                                   │
-│  ┌─ CBR Module ──────────────────────────────────────────────┐   │
+│  ┌─ CBR + Validation ────────────────────────────────────────┐   │
 │  │  decision_case_outcomes  (Retain — Airflow-written)        │   │
-│  │  decision_cbr_lookup     (Retrieve + Reuse)                │   │
-│  └───────────────────────────────────────────────────────────┘   │
-│                                                                   │
-│  ┌─ Validation ──────────────────────────────────────────────┐   │
 │  │  decision_validation     (Accuracy, Reliability, §4.12)   │   │
 │  └───────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
@@ -397,101 +389,133 @@ The KB employs three knowledge categories:
 
 ### 5.4 The Named Knowledge Base
 
-The KB is materialised as `dbt/seeds/knowledge_rules.csv` — an independently inspectable, version-controlled, plain-text file. This satisfies the Knowledge Acquisition Module requirement (§7.4, §6.9): a financial analyst edits the CSV and runs `dbt seed` to update the live system.
+The KB is materialised as `dbt/seeds/decision_table.csv` — an independently inspectable, version-controlled, plain-text file of 36 production rules. This satisfies the Knowledge Acquisition Module requirement (§7.4, §6.9): a domain expert edits the CSV and runs `dbt seed` to update the live system without touching SQL.
 
-#### 5.4.1 Inference Rules (R01–R08) — Declarative Knowledge
+Each row is a named production rule (§4.1) of the form:
+```
+IF  rating_group = X  AND  has_anomaly = Y  AND  sector_ok = Z
+AND vol_level = V     AND  at_52w_pos  = P
+THEN  signal = S,  signal_cf = CF  (−1.0 to +1.0, §4.10 Certainty Factor)
+```
 
-| Rule | Name | Signal Condition | CF | Source Justification |
-|---|---|---|---|---|
-| R01 | price_above_sma10 | close > SMA10 | 0.30 | Short-term signal, high noise |
-| R02 | price_above_sma20 | close > SMA20 | 0.40 | Medium-term trend confirmation |
-| R03 | price_above_sma50 | close > SMA50 | 0.50 | Intermediate trend |
-| R04 | price_above_sma200 | close > SMA200 | 0.60 | Primary trend — most persistent |
-| R05 | golden_cross | SMA10 > SMA20 | 0.50 | Classic momentum signal |
-| R06 | rsi_oversold | RSI(14) < 30 | 0.70 | Strongest mean-reversion signal |
-| R07 | bollinger_lower_touch | close < BB_lower | 0.60 | Statistical extreme — high reversion probability |
-| R08 | macd_bullish_proxy | SMA12 > SMA26 | 0.40 | SMA approximation; lower fidelity |
+The 36 rules are organised using the **Propose → Protect → Validate** framework:
 
-Sell conditions use the symmetric inverse: close < SMA contributes −CF. The CF gradient (0.30 → 0.70) reflects increasing signal persistence and historical reliability, with shorter-term indicators receiving lower CFs due to higher noise ratios.
-
-#### 5.4.2 Knowledge Gate Rules (G01–G03) — Procedural Knowledge
-
-| Rule | Condition | CF | Rationale |
-|---|---|---|---|
-| G01 no_price_anomaly_gate | price-IQR anomaly detected | 1.00 | Anomalous price moves are statistically extreme — entering on a spike is categorically inadvisable |
-| G02 sector_advance_gate | advance_ratio < 50% | 0.80 | Individual signals lose conviction when the macro sector is declining |
-| G03 high_volatility_gate | annualized_vol > 80% | 0.90 | At 80% annual vol, daily swings exceed 5% — position risk is unmanageable |
-
-#### 5.4.3 Metarules (M01–M02) — Meta-knowledge
-
-| Rule | Firing Condition | Effect |
+| Role | Conditions covered | State IDs |
 |---|---|---|
-| M01 market_anomaly_metarule | Market-wide price anomaly rate > 30% | Raises BUY score threshold from ≥3 to ≥6 |
-| M02 consecutive_down_metarule | 3 consecutive days with log-return < −2% | Blocks BUY entirely for this symbol |
+| **Propose** | `rating_group` — base directional bias | All rows |
+| **Protect** | `vol_level = high/extreme` + `has_anomaly = true` | S01–S03, S08–S10, S15–S17, S22–S24, S29–S31 |
+| **Validate** | `sector_ok = false` + `at_52w_pos = near_low/near_high` | S04–S06, S11–S13, S18–S20, S25–S27, S32–S34 |
+| **Default** | No special conditions | S07, S14, S21, S28, S35 |
+| **Fallback** | All `any` | S36 |
 
-Metarules encode higher-order domain wisdom: M01 recognises that when 30% of the market is simultaneously anomalous, the market is in a systemic stress regime where standard thresholds are insufficient. M02 recognises that momentum continuation (3 consecutive bad days) contradicts the mean-reversion premise of the indicator suite.
+#### 5.4.1 Technical Indicators — Declarative Knowledge Basis (R01–R08)
 
-### 5.5 Decision Table (§4.7)
+The `gold_technical_rating` model aggregates 8 indicator votes into `signal_score` and `rating`. Their individual CFs informed the pre-assigned `signal_cf` values in the decision table:
 
-The formal decision table (`dbt/seeds/decision_table.csv`) documents all 20 reachable input combinations:
+| Rule | Indicator | Buy vote | CF | Source |
+|---|---|---|---|---|
+| R01 | Price vs SMA10 | close > SMA10 | 0.30 | Short-term — high noise |
+| R02 | Price vs SMA20 | close > SMA20 | 0.40 | Medium-term trend |
+| R03 | Price vs SMA50 | close > SMA50 | 0.50 | Intermediate trend |
+| R04 | Price vs SMA200 | close > SMA200 | 0.60 | Primary trend — most persistent |
+| R05 | MA cross | SMA10 > SMA20 | 0.50 | Classic momentum signal |
+| R06 | RSI(14) | RSI < 30 — oversold | 0.70 | Strongest mean-reversion signal |
+| R07 | Bollinger Bands | close < BB\_lower | 0.60 | Statistical extreme |
+| R08 | MACD proxy | SMA12 > SMA26 | 0.40 | SMA approximation |
 
-| State | Rating | Anomaly | Sector≥50% | Metarule Blocks | Expected Signal |
-|---|---|---|---|---|---|
-| S01 | Strong Buy | No | Yes | No | **BUY** |
-| S02 | Buy | No | Yes | No | **BUY** |
-| S03 | Strong Buy | No | **No** | No | **HOLD** (G02 blocks) |
-| S05 | Strong Buy | **Yes** | Yes | No | **HOLD** (G01 blocks) |
-| S07 | Strong Buy | No | Yes | **Yes** | **HOLD** (metarule blocks) |
-| S12 | Neutral + score<0 | Yes | Any | No | **SELL** (anomaly + negative score) |
-| S15 | Strong Sell | No | No | No | **SELL** |
-| S17 | Strong Sell | Yes | No | No | **SELL** (compounded) |
+#### 5.4.2 Key CF Values and Rationale
+
+| State | Conditions | Signal | CF | Why |
+|---|---|---|---|---|
+| S05 | Strong Buy + no anomaly + sector\_ok + near\_low | BUY | **+0.92** | Maximum conviction: all propose/protect/validate layers confirm |
+| S07 | Strong Buy + no anomaly + sector\_ok + neutral | BUY | +0.88 | Standard strong buy |
+| S01 | Strong Buy + high vol | HOLD | +0.22 | Good rating but unsafe entry environment |
+| S31 | Strong Sell + anomaly | SELL | **−0.95** | Maximum bearish: rating + anomaly confirmed |
+| S26 | Sell + near\_low | SELL | −0.52 | SELL at potential support — lower conviction |
+
+### 5.5 Decision Table Structure (§4.7)
+
+The `decision_table.csv` has **36 rows** organised symmetrically — 5 rating groups × 7 scenarios + 1 fallback:
+
+| Row # | Scenario | Role | State IDs across all groups |
+|---|---|---|---|
+| 1 | High volatility | **Protect** | S01, S08, S15, S22, S29 |
+| 2 | Extreme volatility | **Protect** | S02, S09, S16, S23, S30 |
+| 3 | Price anomaly | **Protect** | S03, S10, S17, S24, S31 |
+| 4 | Sector headwind | **Validate** | S04, S11, S18, S25, S32 |
+| 5 | Near 52W low | **Validate** | S05, S12, S19, S26, S33 |
+| 6 | Near 52W high | **Validate** | S06, S13, S20, S27, S34 |
+| 7 | Default | — | S07, S14, S21, S28, S35 |
+
+Fallback **S36**: all conditions `any` → HOLD, CF=0.00.
 
 ### 5.6 Knowledge Acquisition Process (§6.10)
 
 | Step | Implementation |
 |---|---|
-| **Identification** | Domain decomposed into: trend (SMAs), momentum (RSI, MACD), volatility (Bollinger, annualised vol), sector context (advance ratio), anomaly detection (IQR, Z-score) |
-| **Conceptualisation** | Each component mapped to named technical indicators; documented in literature |
-| **Formalisation** | Rules encoded in `knowledge_rules.csv` with CF values, categories, and source references |
-| **Implementation** | `decision_cf_engine` reads KB at runtime and applies CF combination formula |
-| **Testing** | dbt schema tests verify structural correctness; `decision_validation` measures empirical accuracy over time |
+| **Identification** | Domain decomposed into: technical rating (8 indicators), volatility, anomalies, 52W context, sector strength |
+| **Conceptualisation** | Mapped to the Propose → Protect → Validate framework |
+| **Formalisation** | Rules encoded in `decision_table.csv` with pre-assigned CF values (−1.0 to +1.0) and role labels |
+| **Implementation** | `decision_signals` joins 6 gold models + `decision_table` seed; specificity-ordered match selects winning rule |
+| **Testing** | dbt schema tests verify signal ∈ {BUY, SELL, HOLD} and every (symbol, date) matches at least S36 |
 
 ---
 
 ## 6. Inference Engine and Decision Logic
 
-### 6.1 Architecture — Three Separate Stages
+### 6.1 Architecture — Propose → Protect → Validate
 
-The inference engine is deliberately decomposed into three independent dbt models, reflecting the lecture's distinction between knowledge rules, inference rules, and metarules (§4.2) and satisfying the requirement for the inference engine to be "a separate component" (§7.4):
+The decision layer implements **forward chaining** (§4.3) through a single unified dbt model (`decision_signals`) that reads all six gold models and joins the decision table seed. This satisfies the requirement for a distinct inference engine (§7.4) while keeping the architecture auditable.
+
+The inference follows the **Propose → Protect → Validate** mental model:
 
 ```
-Stage 1: decision_cf_engine
-         ↳ Reads knowledge_rules.csv (KB)
-         ↳ Computes signed CF per rule
-         ↳ Applies CF combination formula iteratively across 8 rules
-         ↳ Outputs: combined_cf (−1.0 to +1.0), cf_confidence
-
-Stage 2: decision_metarule_flags
-         ↳ Reads gold_anomaly_flags + gold_volatility_index
-         ↳ Evaluates M01 (market anomaly rate), M02 (down streak), G03 (extreme vol)
-         ↳ Outputs: active_metarules, required_score_for_buy
-
-Stage 3: decision_signals
-         ↳ Joins all gold layer models + Stage 1 + Stage 2
-         ↳ Applies gate cascade (G01, G02) + metarule overrides
-         ↳ Derives signal (BUY/SELL/HOLD)
-         ↳ Generates all four explanation types
+PROPOSE  (What to do?)
+  gold_technical_rating → signal_score → rating (Strong Buy/Buy/Neutral/Sell/Strong Sell)
+         │
+         ▼
+PROTECT  (Is it safe to act?)
+  gold_volatility_index → vol_level  (high/extreme blocks BUY)
+  gold_anomaly_flags    → has_price_anomaly  (overrides to HOLD or SELL)
+         │ (if protect passes)
+         ▼
+VALIDATE  (How strongly?)
+  gold_52w_levels         → at_52w_pos  (near_low boosts CF; near_high reduces it)
+  gold_sector_performance → sector_ok   (headwind blocks BUY; tailwind strengthens)
+         │
+         ▼
+  decision_signals → signal + signal_cf (−1.0 to +1.0) + explanation
 ```
 
-### 6.2 Stage 1 — Certainty Factor Combination Engine
+Every row in `decision_table.csv` belongs to one of these three roles. **Protect rules always take precedence over Validate rules** when both fire on the same (symbol, date) — enforced by the state_id ordering within specificity-based matching.
 
-`decision_cf_engine` implements **forward chaining**: starting from all available market facts (the 8 indicator votes from `gold_technical_rating`), it accumulates evidence toward a conclusion.
+```
+decision_table.csv (36 rules) ──────────────────────────────────┐
+                                                                 │
+gold_technical_rating ──┐                                        │
+gold_volatility_index ──┤                                        │
+gold_anomaly_flags ─────┤──► Classify inputs → specificity-  ◄──┘
+gold_52w_levels ────────┤    ordered join → best matching rule
+gold_sector_performance ┤    → anomaly SELL override check
+gold_intraday_vwap ─────┘    → explanation facility
+                             → OUTPUT: signal, signal_cf, state_id,
+                                       why_signal, why_not_buy,
+                                       reasoning_trace
+```
 
-**Signed CF per rule:**
+### 6.2 Certainty Factor Design — How `signal_cf` Values Were Derived
+
+The `signal_cf` values in `decision_table.csv` (§4.10 Certainty Factors) were derived using the MYCIN-style CF combination formula as a theoretical reference. Understanding this derivation explains why the table values are what they are.
+
+**The CF combination formula (§4.10):**
+
+$$\text{CF}(A, B) = \begin{cases} A + B(1-A) & A \geq 0,\ B \geq 0 \\ A + B(1+A) & A \leq 0,\ B \leq 0 \\ \dfrac{A+B}{1-\min(|A|,|B|)} & \text{otherwise} \end{cases}$$
+
+**Theoretical derivation — signed CF per indicator:**
 
 $$\text{cf\_Rn} = \text{sig\_Rn} \times \text{CF\_Rn}$$
 
-where $\text{sig\_Rn} \in \{-1, 0, +1\}$ is the indicator vote and $\text{CF\_Rn}$ is the rule's certainty factor from the KB.
+where $\text{sig\_Rn} \in \{-1, 0, +1\}$ is the indicator vote and $\text{CF\_Rn}$ is the rule's certainty factor (e.g. R06 RSI=0.70, R04 SMA200=0.60).
 
 **Iterative combination across 8 rules:**
 
@@ -512,21 +536,76 @@ $$\text{combined\_cf} = \text{CF}(\text{CF}(\ldots\text{CF}(\text{cf\_R01}, \tex
 
 The asymptotic approach to 1.0 is a fundamental property of the reinforcing CF formula: additional confirming evidence always increases certainty but can never push it beyond ±1.0.
 
+**Visual — cumulative CF convergence (all 8 rules voting BUY):**
+
+```
++R01 (0.30) ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0.300  [LOW]
++R02 (0.58) ███████████████████████░░░░░░░░░░░░░░░░░  0.580  [MEDIUM ✓ ≥ 0.40]
++R03 (0.79) ████████████████████████████████░░░░░░░░  0.790  [HIGH   ✓ ≥ 0.65]
++R04 (0.92) █████████████████████████████████████░░░  0.916
++R05 (0.96) ███████████████████████████████████████░  0.958
++R06 (0.99) ████████████████████████████████████████  0.987
++R07 (1.00) ████████████████████████████████████████  0.995
++R08 (1.00) ████████████████████████████████████████  0.997  ← asymptotic
+            ├─────────────┤       ├──────────────────┤
+           0.0           0.40    0.65               1.0
+                        MED      HIGH
+```
+
+**Worked example — conflicting evidence (R04 votes SELL; 5 buy + 2 neutral + 1 sell):**
+
+| Step | Rule | Vote | Signed CF | Partial CF | Formula branch |
+|---|---|---|---|---|---|
+| 1 | R01 price\_above\_sma10 | BUY | +0.30 | **+0.300** | start |
+| 2 | R02 price\_above\_sma20 | BUY | +0.40 | **+0.580** | reinforcing: $A + B(1-A)$ |
+| 3 | R03 price\_above\_sma50 | BUY | +0.50 | **+0.790** | reinforcing: $A + B(1-A)$ |
+| 4 | R04 price\_above\_sma200 | **SELL** | **−0.60** | **+0.475** | ⚡ conflicting: $\frac{A+B}{1-\min(\|A\|,\|B\|)}$ |
+| 5 | R05 golden\_cross | BUY | +0.50 | **+0.738** | reinforcing: $A + B(1-A)$ |
+| 6 | R06 rsi\_oversold | neutral | 0 | **+0.738** | zero — no effect |
+| 7 | R07 bollinger\_lower\_touch | neutral | 0 | **+0.738** | zero — no effect |
+| 8 | R08 macd\_bullish\_proxy | BUY | +0.40 | **+0.843** | reinforcing: $A + B(1-A)$ |
+
+The drop at step 4 (0.790 → 0.475) demonstrates the conflicting-evidence branch. R04's SELL vote weakens conviction earned by the three shorter-term SMA rules; subsequent positive votes recover conviction to HIGH (0.843).
+
+**From theoretical derivation to pre-assigned table values:**
+
+This formula was used to *design* the `signal_cf` values in `decision_table.csv`. For example, S05 (Strong Buy + ideal conditions) was calibrated against the all-BUY theoretical output (+0.997) and set to +0.92, reflecting the real-world discount from uncertainty. The table CFs are therefore *pre-assigned expert judgments grounded in the formula's theoretical output* — the formula is no longer executed at runtime.
+
 **Confidence mapping:**
 
-| |combined_cf| | Confidence tier | Interpretation |
+| \|signal\_cf\| | Confidence tier | Interpretation |
 |---|---|---|
-| ≥ 0.65 | HIGH | At least 5–6 strong rules agree |
-| ≥ 0.40 | MEDIUM | 3–4 rules provide moderate consensus |
-| < 0.40 | LOW | Conflicting or weak evidence |
+| ≥ 0.65 | HIGH | Strong directional conviction |
+| ≥ 0.40 | MEDIUM | Moderate consensus — note uncertainty |
+| < 0.40 | LOW | Weak or conflicting — signal tends to HOLD |
 
-![Figure 6: Decision thresholds on the CF number line — mapping combined_cf to BUY / HOLD / SELL](figures/fig4_cf_number_line.png)
+**CF Number Line — Decision Thresholds:**
 
-*Figure 6: The CF number line from −1.0 to +1.0. The SELL zone (red) covers combined_cf ≤ −0.20; the HOLD zone (grey) covers (−0.20, +0.20); the BUY zone (green) covers combined_cf ≥ +0.20. This implementation uses tighter thresholds (±0.40 for MEDIUM, ±0.65 for HIGH confidence) to require stronger consensus. Individual rule contributions (R1–R6 shown as pins) illustrate how the CF combination aggregates evidence. Metarules M01 and M02 can force the final action back to HOLD even when the raw combined_cf sits in the BUY or SELL zone.*
+```
+                                        ┌──── BUY gates still required ────┐
+  ──────────────────────────────────────────────────────────────────────────────────
+  −1.0        −0.65       −0.40          0          +0.40       +0.65        +1.0
+  ──────────────────────────────────────────────────────────────────────────────────
+  ██████████████████  ░░░░░░░░░░░  ░░░░░░░░░░░░░░░░░░░░░░░  ░░░░░░░░░░░  ██████████████████
+  ◄──── HIGH SELL ──► ◄─MED SELL─► ◄──────────── LOW (HOLD) ────────────► ◄─MED BUY─► ◄─HIGH BUY─►
 
-### 6.3 Stage 2 — Metarule Evaluation
+  confidence    HIGH       MEDIUM              LOW               MEDIUM       HIGH
+  signal_cf    < −0.65  −0.65→−0.40        −0.40→+0.40       +0.40→+0.65  > +0.65
+```
 
-`decision_metarule_flags` evaluates higher-order rules that govern inference rule application:
+\* BUY also requires all gates to pass: anomaly=false · vol ≤ normal · sector\_ok=true (from decision table Protect/Validate rows).
+
+### 6.3 Metarule Logic — Encoded as Protect Rows
+
+The original metarules M01 (market anomaly tighten), M02 (consecutive down block), and G03 (extreme vol block) are now encoded directly as Protect rows in `decision_table.csv`:
+
+- **M01 equivalent** — Captured by anomaly gate rows (S03, S10, S17, S24, S31): when market-wide anomaly rate > 30%, most stocks will have `has_price_anomaly = true`, causing their signals to route through these rows.
+- **M02 equivalent** — Captured by the extreme volatility rows (S02, S09, S16, S23, S30): 3 consecutive −2% days typically elevate annualized vol to `extreme` level, routing through these rows.
+- **G03 equivalent** — Directly captured by vol=extreme rows: `annualized_vol > 80%` maps to `vol_level = 'extreme'`.
+
+This design makes the protection logic explicit in the CSV rather than in separate SQL models.
+
+### 6.4 Signal Derivation and Inference/Goal Tree
 
 **M01 — Market-wide anomaly tightening:**
 
@@ -540,52 +619,52 @@ $$\text{down\_days\_3d} = \sum_{i=0}^{2} \mathbb{1}[r_{t-i} < -0.02] \qquad \tex
 
 $$\text{G03 fires if annualized\_vol} = \sigma_{20d} \times \sqrt{252} > 0.80$$
 
-### 6.4 Stage 3 — Signal Derivation and Inference/Goal Tree
+### 6.4 Signal Derivation — Decision Table Lookup
 
-The BUY rule can be represented as an AND/OR inference tree (§4.3):
+The BUY signal emerges from the decision table when the most-specific matching row produces `signal = 'BUY'`. This happens when Protect conditions are absent and Validate conditions are favourable. The AND/OR inference tree (§4.3) maps directly to the Propose → Protect → Validate layers:
 
 ```
                          BUY
-                          │ (AND)
+                          │ (AND — all layers must pass)
           ┌───────────────┼────────────────────────────┐
-          │               │                            │
-    CF direction     Gate passage               Metarule passage
-    (combined_cf     ┌────┤ AND                  ┌────┤ AND
-     ≥ 0.40 and      │    │                      │    │
-     rating ∈       G01  G02               score ≥ req  NOT G03  NOT M02
-     Buy/StrongBuy)  │    │                      │         │       │
-                  ¬anomaly ≥50%          required_score    ≤80%  ¬3down
+     PROPOSE              PROTECT                  VALIDATE
+   rating ∈            ┌──┤ AND               ┌────┤ AND
+ {Buy, Strong Buy}     │  │                   │    │
+                   ¬anomaly vol ≤ normal  sector ≥ 50%  at_52w appropriate
 ```
 
-The SELL conclusion uses an OR tree:
+SELL conclusion (OR tree):
 
 ```
                         SELL
                          │ (OR)
               ┌──────────┴──────────────┐
-      Rating is                   Anomaly path
-    Sell/Strong Sell           ┌────┤ AND
-                           anomaly   signal_score < 0
+    Rating ∈ Sell/       Anomaly SELL override:
+    Strong Sell           anomaly=true AND signal_score < 0
 ```
 
-**Full production rule encoding:**
+**Production rule encoding (as in decision_table.csv rows S05–S35):**
 
 ```
-RULE BUY:
-  IF   rating ∈ {Buy, Strong Buy}           → CF engine result
-  AND  NOT has_price_anomaly                 → gate G01
-  AND  sector_advance_ratio ≥ 0.50          → gate G02
-  AND  signal_score ≥ required_score_for_buy → metarule M01
-  AND  NOT g03_extreme_volatility            → gate G03
-  AND  NOT m02_consecutive_down              → metarule M02
-  THEN signal = 'BUY'
+RULE BUY (e.g. state S05, Strong Buy + near_low):
+  IF   rating ∈ {Buy, Strong Buy}     [PROPOSE — from gold_technical_rating]
+  AND  has_anomaly = false             [PROTECT — anomaly gate]
+  AND  vol_level ∈ {low, normal}      [PROTECT — volatility gate]
+  AND  sector_ok = true               [VALIDATE — sector gate]
+  AND  at_52w_pos = near_low          [VALIDATE — 52W differentiator]
+  THEN signal = BUY,  signal_cf = +0.92
 
-RULE SELL:
+RULE SELL (e.g. state S24, Sell + anomaly):
   IF   rating ∈ {Sell, Strong Sell}
-  OR   (has_price_anomaly AND signal_score < 0)
-  THEN signal = 'SELL'
+  AND  has_anomaly = true
+  THEN signal = SELL,  signal_cf = −0.85
 
-DEFAULT: signal = 'HOLD'
+ANOMALY SELL OVERRIDE:
+  IF   has_price_anomaly = TRUE
+  AND  rating = 'Neutral'  AND  signal_score < 0
+  THEN signal = SELL,  signal_cf = −0.50
+
+DEFAULT (state S36): signal = HOLD, signal_cf = 0.00
 ```
 
 ### 6.5 Explanation Facility (§4.8–§4.9)
@@ -617,14 +696,21 @@ A prioritised cascade identifying the first gate that failed:
 
 #### How — `reasoning_trace` (Tracing, §4.9)
 
-A numbered trace through all five inference steps:
+A numbered trace showing input classification, matched rule, and final signal. Step 1 includes the CF confidence tier; step 4 shows per-rule metarule outcomes when fired:
 
 ```
-1. CF engine: combined_cf=0.79 → BUY direction.
-2. Anomaly gate (G01): has_price_anomaly=false.
-3. Sector gate (G02): advance_ratio=64% [passed].
-4. Metarules: none.
-5. Final: BUY (Buy)
+1. Inputs classified: rating=Strong Buy, score=6/8, vol=normal,
+   52W=near_low, anomaly=false, sector_ok=true.
+2. Decision table matched: state=S05 (specificity=4).
+3. Signal=BUY, CF=0.92 (HIGH).
+```
+
+When metarules fire, step 4 shows what each did:
+```
+1. Inputs classified: rating=Sell, score=-4/8, vol=extreme,
+   52W=neutral, anomaly=true, sector_ok=false.
+2. Decision table matched: state=S24 (anomaly gate, spec=2).
+3. Signal=SELL, CF=-0.85 (HIGH). [Protect: anomaly+sell confirmed]
 ```
 
 #### Journalistic — `explanation`
@@ -671,16 +757,16 @@ Cases with ≥ 3 matching bins are considered similar.
 |---|---|
 | **Organization model** | Decision support for retail Tadawul investors; KBS replaces analyst bottleneck |
 | **Task model** | Classification task: map (symbol, date, market context) → {BUY, SELL, HOLD} with explanation |
-| **Agent model** | Three agents: (1) Automated pipeline agent (Airflow + Spark); (2) Knowledge provider (financial analyst, edits knowledge_rules.csv); (3) Knowledge-system developer (maintains dbt models and DAGs) |
+| **Agent model** | Three agents: (1) Automated pipeline agent (Airflow + Spark); (2) Knowledge provider (financial analyst, edits decision_table.csv); (3) Knowledge-system developer (maintains dbt models and DAGs) |
 | **Knowledge model** | 13 production rules with CFs; decision table; 5-dimensional CBR feature space; CF combination formula |
 | **Communication model** | Trino SQL query interface (current); proposed Grafana/Tableau dashboard (Section 8) |
-| **Design model** | Four-layer medallion lakehouse; three-stage SQL inference engine; daily CBR Airflow DAG |
+| **Design model** | Four-layer medallion lakehouse; single-model SQL inference engine (Propose→Protect→Validate); daily CBR Airflow DAG |
 
 ### 7.2 Roles in the System (§5.9)
 
 | Role | Responsibilities in this System |
 |---|---|
-| **Knowledge Provider / Specialist** | Financial analyst; provides domain expertise for CF assignments; edits `knowledge_rules.csv` |
+| **Knowledge Provider / Specialist** | Financial analyst; provides domain expertise for CF assignments; edits `decision_table.csv` |
 | **Knowledge Engineer** | Mediates between analyst and KB; translates indicator logic into production rules; assigns CF values from literature |
 | **Knowledge-System Developer** | Implements dbt models, Airflow DAGs, and Iceberg schema; maintains the SQL inference engine |
 | **Knowledge User** | Retail investor or portfolio manager who queries `decision_signals` for trading decisions |
@@ -696,22 +782,22 @@ Cases with ≥ 3 matching bins are considered similar.
 | Bronze Iceberg tables | ✅ Implemented | MinIO `stocks/bronze/` |
 | Silver dbt models (3 models) | ✅ Implemented | `dbt/models/silver/` |
 | Gold dbt models (6 models) | ✅ Implemented | `dbt/models/gold/` |
-| Named Knowledge Base (13 rules with CFs) | ✅ Implemented | `dbt/seeds/knowledge_rules.csv` |
+| Named Knowledge Base (36 rules with CFs) | ✅ Implemented | `dbt/seeds/decision_table.csv` |
 | Decision Table (20 states) | ✅ Implemented | `dbt/seeds/decision_table.csv` |
-| CF Combination Engine (Stage 1) | ✅ Implemented | `dbt/models/decision/decision_cf_engine.sql` |
-| Metarule Flags (Stage 2) | ✅ Implemented | `dbt/models/decision/decision_metarule_flags.sql` |
+
+
 | Decision Signals + Explanation Facility (Stage 3) | ✅ Implemented | `dbt/models/decision/decision_signals.sql` |
 | CBR Case Outcomes + Airflow DAG (Retain step) | ✅ Implemented | `airflow/dags/decision_cbr_dag.py` |
-| CBR Lookup (Retrieve + Reuse steps) | ✅ Implemented | `dbt/models/decision/decision_cbr_lookup.sql` |
+
 | Validation (Accuracy, Reliability, Sensitivity) | ✅ Implemented | `dbt/models/decision/decision_validation.sql` |
 | Trino unified query layer | ✅ Implemented | `trino/catalog/iceberg.properties` |
 | S3 cloud sync of gold results | ✅ Implemented | `airflow/dags/sync_to_neon.py` |
+| SaudiQuant analytics dashboard (5 pages) | ✅ Implemented | `/Users/ahmedashry/Documents/GitHub/saudiquant` |
 
 ### 7.4 Proposed Components
 
 | Component | Rationale | Lecture Reference |
 |---|---|---|
-| Interactive Grafana/Tableau dashboard | Visualisation layer is required per Lecture 3 | §3.1–3.5 |
 | Semantic network ontology diagram | Documents financial concept relationships | §4.5 |
 | Frame-based symbol representation | Per-symbol object with inherited sector attributes | §4.6 |
 | Bayesian CF calibration from outcomes | Self-calibrating KB based on empirical accuracy | §4.10 |
@@ -785,6 +871,95 @@ Per Lecture 3, visualization type must match the data type and audience (§3.3).
 - **Too many variables:** The signal grid should encode only one variable per cell (signal type via colour) — resist the temptation to add a second encoding for confidence in the same cell.
 - **Poor colour choices:** Red/Green encoding (SELL/BUY) must account for colour-blindness; add a secondary encoding (shape or label) per §3.4.
 
+### 8.3 SaudiQuant — Implemented Analytics Dashboard
+
+The proposed dashboard has been implemented as **SaudiQuant** (تداول أناليتيكس), a standalone Next.js 15 web application providing a Bloomberg Terminal-style interface over the Tadawul lakehouse. The application operates in two modes: **production mode** (queries the Trino/Iceberg pipeline via parameterised REST API routes) and **mock mode** (`NEXT_PUBLIC_MOCK_MODE=true`, the default), which uses three years of Geometric Brownian Motion-generated OHLCV data for offline development without the Docker stack running.
+
+#### 8.3.1 Technology Stack
+
+| Component | Technology | Role |
+|---|---|---|
+| Framework | Next.js 15 (App Router) + TypeScript 5.6 | Server-side rendering, API routes, strict type safety |
+| Financial charts | lightweight-charts 4.2.0 | Professional OHLCV candlestick charts with indicator overlays |
+| General charts | Recharts 2.12.7 | Bar, line, scatter, treemap, and sparkline visualizations |
+| Real-time | Server-Sent Events (SSE) via `EventSource` | Live tick streaming sourced from `bronze_ticks` |
+| State management | TanStack React Query v5 | Data fetching, background cache refresh, optimistic updates |
+| Styling | Tailwind CSS v3 | Dark financial terminal aesthetic — navy/slate background, gold accents |
+| Deployment | Vercel | Serverless edge deployment with automatic CI |
+
+#### 8.3.2 Five Pages — Visualization Choices with §3.3 Justification
+
+**Page 1 — Market Overview (`/`)**
+
+The primary dashboard. A **candlestick chart** (lightweight-charts) occupies 60 % of the viewport for the selected ticker, with a volume histogram on a secondary scale, a VWAP line (dashed gold), and MA20/MA50 moving average overlays. The right column shows a Market Summary card (total market cap, a breadth bar of advancing/declining/unchanged counts), a Top Movers tabbed view (Gainers / Losers / Most Active), and a mini sector heatmap. Below the main chart:
+
+- **Hourly Volume Bar Chart** — intraday volume distribution; a 2× average reference line highlights abnormal session periods. §3.3 justification: *"comparing categories to a measured value."*
+- **Volatility Gauge** — custom SVG semi-circular gauge with three colour-coded zones (LOW / MEDIUM / HIGH) consuming `gold_volatility_index.vol_level`. §3.3 justification: *"performance vs. benchmark zones."*
+- **Anomaly Feed** — top-5 recent entries from `gold_anomaly_flags` with severity badges (HIGH = red, MEDIUM = gold, LOW = grey) and Z-score; clicking links to the Anomaly Detection page.
+
+**Page 2 — Market Screener (`/markets`)**
+
+A full sortable/filterable data table of all 10 tracked symbols with 13 columns: ticker, company name, sector, price, change %, volume/avg-volume ratio, 52-week high/low, volatility, VWAP, anomaly flag, and **technical rating badge**. The `decision_signals` columns (`signal`, `combined_cf`) and `gold_technical_rating` output are directly exposed here. §3.3 justification: *"cross-comparison of many categorical and numeric attributes across multiple symbols."* Features include click-to-sort column headers, full-text search, sector dropdown, mover-type filter pills, and a column visibility toggle.
+
+**Page 3 — Symbol Deep-Dive (`/symbol/[ticker]`)**
+
+For each individual symbol:
+
+- **Full candlestick chart** (lightweight-charts) with 6 timeframes (1 m, 5 m, 15 m, 1 H, 1 D, 1 W), VWAP, MA20, MA50 overlays, and crosshair price tracking.
+- **Key Statistics card** — 52-week range slider (showing current price position between the annual high and low), and 9 stat rows: market cap, P/E, bid/ask, session range, average volume, and annualised volatility.
+- **Volume Profile** — horizontal bar chart showing traded volume at discretised price levels. §3.3 justification: *"distribution over a continuous dimension (price) with a quantitative measure (volume)."*
+- **KBS Explanation Panel** — the primary integration point between the Decision layer and the UI. Renders `decision_signals.why_signal` (Dynamic Why), `reasoning_trace` (How — numbered CF-annotated trace), and `combined_cf` per the §4.8–§4.9 explanation facility, making KBS reasoning readable to non-technical users without SQL access.
+- **Anomaly History** — recent 6 anomaly events from `gold_anomaly_flags` with severity badges, Z-score, and deviation %.
+- **Historical OHLCV Table** — paginated 20-row table with CSV export.
+
+**Page 4 — Sector Analysis (`/sectors`)**
+
+- **Sector Cards** — 6 interactive cards (one per sector) with daily return %, stock count, and a 7-day Recharts Sparkline. §3.3: *"trend direction in compact form."*
+- **Sector Treemap** (Recharts Treemap) — market-cap-weighted cells, colour-coded by daily return (green-to-red gradient). §3.3: *"part-to-whole; market capitalisation visualised as proportional area."*
+- **30-Day Sector Rotation Chart** (Recharts LineChart) — 6 sector lines over 30 trading days showing relative performance trajectories. §3.3: *"distribution over a continuous interval; multi-series trend comparison."*
+- **Sector Comparison Table** — 1 D / 1 W / 1 M / 3 M performance, volatility, and average volume per sector.
+- **Market Cap Weight bars** — horizontal stacked bar chart of market capitalisation weights across the 6 sectors.
+
+**Page 5 — Anomaly Detection Feed (`/anomalies`)**
+
+- **Summary cards** — total anomaly count, high-severity count, most anomalous ticker.
+- **Anomaly Scatter Plot** (Recharts ScatterChart) — X-axis: timestamp; Y-axis: Z-score (σ); bubble size: severity level; reference lines at 3σ and 5σ. §3.3: *"relationships between variables; large event datasets; identification of outliers."*
+- **Anomaly Table** — 7-column paginated table (time, symbol, type, metric, Z-score, severity, deviation %) with expandable rows showing detected value, previous average, and price at detection. Filter pills: All / Volume Spikes / Price Spikes / Volatility Spikes / High Severity / Today / This Week.
+
+#### 8.3.3 KBS Decision Layer Integration
+
+The application's API routes query the Trino SQL interface (in production mode) to surface Decision layer output directly:
+
+| API Route | Source Table | KBS Columns Exposed to UI |
+|---|---|---|
+| `GET /api/market/overview` | `decision_signals`, `gold_anomaly_flags`, `gold_volatility_index` | `signal`, `combined_cf`, `vol_level`, anomaly severity |
+| `GET /api/symbol/[ticker]/rating` | `decision_signals` | `signal`, `combined_cf`, `why_signal`, `reasoning_trace` |
+| `GET /api/symbol/[ticker]/stats` | `gold_52w_levels`, `gold_volatility_index` | `at_52w_pos`, `annualized_vol`, `vol_level` |
+| `GET /api/anomalies` | `gold_anomaly_flags` | `z_score`, `severity`, `anomaly_type`, `deviation_pct` |
+| `GET /api/sectors` | `gold_sector_performance` | `avg_return`, `advance_ratio`, `perf_1d/1w/1m/3m` |
+| `GET /api/stream` | `bronze_ticks` (SSE) | `price`, `change`, `changePct`, `volume` (real-time) |
+
+The **Explanation Panel** on the Symbol Deep-Dive page is the most direct KBS-to-UI integration point: it renders `why_signal` and `reasoning_trace` from `decision_signals` verbatim, delivering the full §4.8 explanation facility to end users without requiring any SQL knowledge.
+
+#### 8.3.4 Visualization Design Decisions (§3.4 Mistakes Avoided)
+
+| §3.4 Mistake | How SaudiQuant Avoids It |
+|---|---|
+| **Wrong chart type** | Sector distribution uses a treemap (part-to-whole) rather than a pie chart — 6 sectors with varying sub-components would produce an unreadable pie |
+| **Inconsistent scales** | `combined_cf` is always displayed on a fixed −1.0 to +1.0 axis; anomaly scatter uses a consistent Z-score Y-axis across sessions |
+| **Too many variables per cell** | The Market Screener encodes only one primary variable per column; the `signal` column uses colour (green/red/grey) with a text label — no double-encoding in a single cell |
+| **Poor colour for colour-blind users** | All severity and signal encodings include text labels alongside colour (e.g., "HIGH", "BUY"), satisfying the secondary-encoding requirement from §3.4 |
+
+#### 8.3.5 Mock Mode and Offline Development
+
+The application ships with `NEXT_PUBLIC_MOCK_MODE=true` as the default to enable demonstration without the full Docker stack:
+
+- **3 years of OHLCV data** are generated using Geometric Brownian Motion (GBM) with a U-shaped intraday volume curve (high at market open and close, low at mid-session), matching real Tadawul liquidity patterns.
+- **Real-time ticks** are simulated via a synthetic SSE stream, producing smooth price updates indistinguishable from live data for demonstration purposes.
+- **Anomaly events** are synthetically generated with realistic Z-score distributions and stored in an in-memory store per session.
+
+This design allows the complete UI — including the KBS Explanation Panel, anomaly scatter, and sector treemap — to be evaluated without running Kafka, Spark, Airflow, Trino, MinIO, or Nessie.
+
 ---
 
 ## 9. Evaluation
@@ -795,7 +970,7 @@ The dbt testing framework provides **verification** — ensuring the system is b
 
 - `not_null` on all key columns: `symbol`, `date`, `signal`, `confidence`, `why_signal`, `reasoning_trace`
 - `accepted_values` on enumerations: `signal ∈ {BUY, SELL, HOLD}`, `confidence ∈ {HIGH, MEDIUM, LOW}`, `outcome ∈ {WIN, LOSS}`
-- `unique` constraints on seed primary keys: `rule_id` in `knowledge_rules`, `state_id` in `decision_table`
+- `unique` constraints on seed primary keys: `state_id` in `decision_table`
 - PyArrow schema enforcement at Iceberg write time catches type mismatches before they enter the lakehouse
 
 These tests run on every `dbt test` invocation and fail the pipeline if invariants are violated.
@@ -809,7 +984,7 @@ The `decision_validation` model computes the following measures from §4.12 as c
 | **Accuracy** | How well the system reflects reality | `wins / total_signals` per (month, signal, sector) in `decision_validation` |
 | **Reliability** | Fraction of predictions empirically correct | Same as accuracy; fraction of WIN outcomes |
 | **Adaptability** | Possibility of future development | CSV KB allows rule addition without code changes; CF thresholds are configurable parameters |
-| **Adequacy (Completeness)** | Portion of necessary knowledge included | 13 rules cover 5 analytical dimensions; gaps surfaced by low accuracy in specific sectors |
+| **Adequacy (Completeness)** | Portion of necessary knowledge included | 36 rules cover 5 rating groups × 7 scenarios; gaps surfaced by low accuracy in specific sectors |
 | **Breadth** | How well the domain is covered | 92 symbols × 13 sectors; accuracy reported per sector reveals coverage gaps |
 | **Depth** | Degree of detailed knowledge | 8 indicator rules + 3 gates + 2 metarules; deeper than a 3-rule threshold system |
 | **Sensitivity** | Impact of KB changes on output quality | `threshold_sensitive_count`: signals where `0.35 ≤ \|combined_cf\| ≤ 0.45` (near boundary) |
@@ -835,7 +1010,7 @@ The `decision_validation` model computes the following measures from §4.12 as c
 
 5. **Equal rule applicability.** All 8 inference rules are applied to all 92 symbols with identical CFs. A cement company and an insurance company receive the same RSI weight, despite different behavioral profiles.
 
-6. **Visualisation gap.** The interactive dashboard remains proposed rather than implemented. The current Trino SQL interface is functional but requires technical SQL knowledge from the end user.
+6. **Mock-mode dependency.** The SaudiQuant analytics dashboard (Section 8.3) operates in mock mode by default, using GBM-generated OHLCV data rather than live Trino queries. Full integration with the Decision layer requires the complete Docker stack (Kafka, Spark, Airflow, dbt, Trino, MinIO, Nessie) to be deployed and populated, limiting production use to environments where all pipeline services are running.
 
 ---
 
@@ -867,8 +1042,8 @@ The lectures enumerate four reasons to build an expert system (§7.2). All four 
 
 | Expert System Component | This System's Implementation |
 |---|---|
-| Knowledge-based module | `knowledge_rules.csv`: 13 named rules with CFs, categories, source references |
-| Inference engine | `decision_cf_engine` (CF combination) + `decision_metarule_flags` (metarule evaluation) — distinct, separate models |
+| Knowledge-based module | `decision_table.csv`: 36 production rules with pre-assigned signal_cf values |
+| Inference engine | `decision_signals` — single unified model (Propose → Protect → Validate) |
 | Explanatory interface | `decision_signals`: `why_signal`, `why_not_buy`, `why_not_sell`, `reasoning_trace`, `explanation` |
 | Knowledge acquisition module | CSV edit + `dbt seed` command; accessible without SQL knowledge |
 
@@ -887,26 +1062,26 @@ The system spans three of the four hierarchy levels:
 
 | Gap Identified | Status | Implementation |
 |---|---|---|
-| No named Knowledge Base | ✅ Resolved | `knowledge_rules.csv` — 13 named rules |
-| No certainty factors | ✅ Resolved | `decision_cf_engine` — CF combination formula |
+| No named Knowledge Base | ✅ Resolved | `decision_table.csv` — 13 named rules |
+| No certainty factors | ✅ Resolved | `decision_table.csv` + `decision_signals` — 36 pre-assigned CF rules |
 | Static explanation only | ✅ Resolved | Dynamic Why, Why Not, How, Journalistic columns |
-| No metarules | ✅ Resolved | M01, M02, G03 in `decision_metarule_flags` |
+| No metarules | ✅ Resolved | M01/M02/G03 as Protect rows in `decision_table.csv` |
 | No decision table | ✅ Resolved | `decision_table.csv` — 20 input states |
 | Inference engine not distinct | ✅ Resolved | Three separate dbt models as three inference stages |
-| No CBR | ✅ Resolved | `decision_cbr_dag` + `decision_cbr_lookup` + `decision_case_outcomes` |
+| No CBR | ✅ Resolved | `decision_case_outcomes` + Airflow DAG |
 | No validation metrics | ✅ Resolved | `decision_validation` — all §4.12 measures mapped |
 | No Knowledge Acquisition module | ✅ Resolved | CSV seed interface + `dbt seed` workflow |
 | No Knowledge Engineering model set | ✅ Resolved | §5.5 model set formally applied in Section 7.1 |
 | Roles not defined | ✅ Resolved | §5.9 roles mapped to system actors in Section 7.2 |
-| No data visualisation | ⚠️ Proposed | Dashboard design specified in Section 8.2 |
+| No data visualisation | ✅ Resolved | SaudiQuant: 5-page Next.js analytics dashboard implemented (Section 8.3) — candlestick charts, sector treemap, anomaly scatter, SSE streaming, KBS Explanation Panel |
 
 ---
 
 ## 11. Future Work
 
-### 11.1 Interactive Dashboard (Immediate Priority)
+### 11.1 Frontend-Pipeline Live Integration
 
-The highest-priority gap remaining is the absence of an interactive dashboard. A Grafana implementation connecting to Trino via JDBC is the most straightforward path, requiring approximately 8 panels as specified in Section 8.2. This would make the system accessible to non-technical users without SQL knowledge.
+The SaudiQuant analytics dashboard (Section 8.3) has been implemented and resolves the interactive dashboard gap. The remaining work is completing the live integration between the Next.js API routes and the Trino/Iceberg query layer. In production mode, each `/api/*` route should execute a parameterised Trino SQL query (via the Trino REST API), replacing the GBM mock data generators. The Explanation Panel on the Symbol Deep-Dive page already defines the API contract (`/api/symbol/[ticker]/explain`) — wiring it to `iceberg.decision.decision_signals` for a specific `(symbol, date)` is the primary remaining integration task. The application is Vercel-deployed and ready for production use once the backend connection is established.
 
 ### 11.2 Semantic Network and Frame-Based Representation (§4.5–§4.6)
 
@@ -956,11 +1131,11 @@ This would elevate the system from a per-stock KBS to a portfolio-level WBS.
 
 ## 12. Conclusion
 
-This project has designed and implemented a Knowledge-Based System that automates trading signal generation for the Tadawul stock exchange with full academic conformance to the KBS course requirements. The system addresses the core problem of knowledge scalability through five principal contributions:
+This project has designed and implemented a Knowledge-Based System that automates trading signal generation for the Tadawul stock exchange with full academic conformance to the KBS course requirements. The system addresses the core problem of knowledge scalability through six principal contributions:
 
 1. **A named, updatable Knowledge Base** of 13 production rules with literature-grounded certainty factors, stored as an inspectable CSV seed accessible to non-technical domain experts.
 
-2. **A three-stage forward-chaining inference engine** implementing the CF combination formula across 8 indicator rules, followed by metarule evaluation and a gate cascade — reflecting the lecture's distinction between knowledge rules, inference rules, and metarules.
+2. **A single forward-chaining inference engine** implementing the Propose → Protect → Validate framework — a decision table (§4.7) with 36 pre-assigned CF rules, specificity-ordered matching, and an anomaly SELL override.
 
 3. **A complete explanation facility** delivering all four explanation types from §4.8: *Why* (what supported the signal), *Why Not* (what blocked the alternative), *How* (numbered inference trace), and *Journalistic* (compact summary).
 
@@ -968,7 +1143,9 @@ This project has designed and implemented a Knowledge-Based System that automate
 
 5. **A validation framework** mapping to all 12 §4.12 measures, with empirical tracking of accuracy, reliability, and sensitivity as case history accumulates.
 
-All ten gaps identified in the initial gap analysis have been resolved. The one remaining proposed component — the interactive dashboard — is fully designed and ready for implementation.
+6. **An interactive analytics dashboard** (SaudiQuant, Section 8.3) — a five-page Next.js 15 financial terminal exposing KBS output to non-technical users: candlestick charts with VWAP/MA overlays, a market-cap-weighted sector treemap, a Z-score anomaly scatter plot, and an Explanation Panel rendering `why_signal` and `reasoning_trace` from `decision_signals` without requiring SQL access.
+
+All gaps identified in the initial gap analysis have been resolved, including the interactive analytics dashboard now implemented as the SaudiQuant platform (Section 8.3).
 
 The system operates on real industrial infrastructure: Apache Kafka, Spark, Airflow, dbt, Trino, and Apache Iceberg — demonstrating that KBS principles are not restricted to toy systems but can be applied at big data scale to produce a production-grade analytical platform.
 

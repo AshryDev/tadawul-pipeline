@@ -246,7 +246,7 @@ table.append(arrow_table)                  # re-write clean
 
 **Hybrid anomaly detection** — triple-agreement flag (SQL Volume Z-score · SQL Return IQR · Python Isolation Forest):
 
-![bg right:32%](figures/fig3_anomaly_detection.png.png)
+![bg right:32%](figures/fig3_anomaly_detection.png)
 
 Triple-agreement precision: **0.80** vs. 0.38–0.46 for any single detector alone
 
@@ -348,36 +348,41 @@ Stage 3: decision_signals            ← Inference rules (gate cascade)
 
 $$\text{CF}(A, B) = \begin{cases} A + B(1-A) & A \geq 0,\ B \geq 0 \\ A + B(1+A) & A \leq 0,\ B \leq 0 \\ \dfrac{A+B}{1 - \min(|A|,|B|)} & \text{otherwise} \end{cases}$$
 
-**Worked example — all 8 rules vote BUY:**
+**Cumulative CF — all 8 rules voting BUY (asymptotic convergence toward 1.0):**
 
-| Step | Rule (CF) | Partial CF | Calculation |
-|---|---|---|---|
-| 1 | R01 (0.30) | +0.300 | — start — |
-| 2 | R02 (0.40) | +0.580 | 0.30 + 0.40×(1−0.30) |
-| 3 | R03 (0.50) | +0.790 | 0.58 + 0.50×(1−0.58) |
-| 4 | R04 (0.60) | +0.916 | 0.79 + 0.60×(1−0.79) |
-| 8 | R08 (0.40) | **+0.997** | ⋯ asymptotic approach to ±1.0 |
+```
++R01 (0.30) ███████████░░░░░░░░░░░░░░░░░░░░░░░░░  0.30  [LOW]
++R02 (0.58) █████████████████████░░░░░░░░░░░░░░░  0.58  [MEDIUM ✓ ≥0.40]
++R03 (0.79) ████████████████████████████░░░░░░░░  0.79  [HIGH ✓ ≥0.65]
++R04 (0.92) █████████████████████████████████░░░  0.92
++R05 (0.96) ███████████████████████████████████░  0.96
++R06 (0.99) ████████████████████████████████████  0.99
++R07+R08    ████████████████████████████████████  0.997  ← asymptotic, never reaches 1.0
+            ├─────────────┤       ├──────────────┤
+           0.0           0.40    0.65            1.0
+                        MED      HIGH
+```
 
 ---
 
-## CF Number Line — Decision Zones
+## CF Number Line — Decision Thresholds (§4.10)
 
-![bg left:48%](figures/fig4_cf_number_line.png)
+```
+                                  ┌─── BUY gates still required ───┐
+  ──────────────────────────────────────────────────────────────────────
+  −1.0     −0.65    −0.40          0         +0.40    +0.65     +1.0
+  ──────────────────────────────────────────────────────────────────────
+  ████████████ ░░░░░░░░░ ░░░░░░░░░░░░░░░░░░░░░ ░░░░░░░░░ ████████████
+  ◄─HIGH SELL─►◄─MED SELL►◄──────── LOW = HOLD ────────►◄─MED BUY─►◄─HIGH BUY─►
+```
 
-**Signal zones:**
-- `combined_cf` ≤ −0.20 → **SELL zone**
-- `combined_cf` ∈ (−0.20, +0.20) → **HOLD zone**
-- `combined_cf` ≥ +0.20 → **BUY zone**
+| \|combined\_cf\| | `cf_confidence` | `cf_sell_str` | `cf_buy_str` | Signal |
+|---|---|---|---|---|
+| ≥ 0.65 | **HIGH** | > 0 *(neg side)* | > 0 *(pos side)* | SELL · BUY\* |
+| ≥ 0.40 | **MEDIUM** | > 0 *(neg side)* | > 0 *(pos side)* | SELL · BUY\* |
+| < 0.40 | **LOW** | 0 | 0 | **HOLD** |
 
-**Confidence tiers:**
-
-| \|combined_cf\| | Tier | Meaning |
-|---|---|---|
-| ≥ 0.65 | **HIGH** | ≥ 5–6 strong rules agree |
-| ≥ 0.40 | **MEDIUM** | 3–4 rules in consensus |
-| < 0.40 | **LOW** | Conflicting evidence |
-
-Metarules M01 & M02 can **force HOLD** even when `combined_cf` sits firmly in the BUY zone.
+\* BUY requires all gates: **G01** (no anomaly) · **G02** (sector ≥ 50%) · **G03** (vol ≤ 80%) · **M01/M02** metarules
 
 ---
 
@@ -439,13 +444,15 @@ All six BUY conditions use **AND** logic — any single gate failure blocks the 
 "BUY blocked by metarule M02: 3 consecutive down days (sustained selling pressure)"
 ```
 
-**How** *(Numbered inference trace):*
+**How** *(Numbered trace — step 1 shows CF tier; step 4 shows per-rule outcome):*
 ```
-1. CF engine: combined_cf=0.79 → BUY direction
-2. Anomaly gate (G01): has_price_anomaly=false [passed]
-3. Sector gate (G02): advance_ratio=64% [passed]
-4. Metarules: none active  →  Final: BUY (Buy)
+1. CF engine: combined_cf=0.79 (HIGH) → BUY direction.
+2. Anomaly gate (G01): has_price_anomaly=false.
+3. Sector gate (G02): advance_ratio=64% [passed].
+4. Metarules: none.
+5. Final: BUY (Buy)
 ```
+When metarules fire: `M01 [TIGHTEN — score≥6 required, current=4]` · `G03 [BLOCK — vol=83.2% ann.]`
 
 **Journalistic** *(Who/What/Why/How much):*
 ```

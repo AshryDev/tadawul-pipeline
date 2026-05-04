@@ -1,389 +1,856 @@
 # Decision Layer — Signal Methodology
 
-This document explains exactly how the pipeline produces a **BUY / SELL / HOLD** signal for every Tadawul-listed stock on every trading day, including the equations used, the certainty factor combination, metarule evaluation, and explanation facility.
+This document explains how the pipeline transforms daily market data into an actionable
+**BUY / SELL / HOLD** signal for every Tadawul-listed symbol, with a formal certainty
+factor (−1.0 to +1.0) and a traceable explanation for every decision.
+
+It is written as a system-design document, not a technical spec. The goal is to show
+**why each component exists, why it matters, and how all pieces connect** — so that
+a reviewer, evaluator, or domain expert can follow the full reasoning without needing
+to read SQL.
 
 ---
 
-## Architecture Overview
+## Table of Contents
 
-The decision layer is composed of six dbt models and one Airflow DAG, all feeding into each other in a defined order:
+1. [Executive Summary](#executive-summary)
+2. [Conceptual Model: Propose → Protect → Validate](#conceptual-model-propose--protect--validate)
+3. [System Architecture](#system-architecture)
+4. [Why a Decision Layer?](#why-a-decision-layer)
+5. [Part 1 — The Six Gold Layer Models](#part-1--the-six-gold-layer-models)
+   - 1.1 `gold_technical_rating` — Propose
+   - 1.2 `gold_volatility_index` — Protect (Risk Gate)
+   - 1.3 `gold_anomaly_flags` — Protect (Outlier Gate)
+   - 1.4 `gold_52w_levels` — Validate (Position Context)
+   - 1.5 `gold_sector_performance` — Validate (Market Context)
+   - 1.6 `gold_intraday_vwap` — Execution Timing
+6. [Part 2 — The Decision Table (Knowledge Base)](#part-2--the-decision-table-knowledge-base)
+   - 2.1 Why a Decision Table Instead of Pure ML?
+   - 2.2 Certainty Factors: Quantifying Judgment
+   - 2.3 The 36 Production Rules
+   - 2.4 Specificity-Based Rule Matching
+   - 2.5 Rule Selection Flow
+7. [Part 3 — Anomaly SELL Override](#part-3--anomaly-sell-override)
+8. [Part 4 — How a Signal Is Formed: Step by Step](#part-4--how-a-signal-is-formed-step-by-step)
+9. [Part 5 — Realistic End-to-End Examples](#part-5--realistic-end-to-end-examples)
+10. [Part 6 — Explanation Facility (XAI)](#part-6--explanation-facility-xai)
+11. [Part 7 — Output Columns Reference](#part-7--output-columns-reference)
+12. [Part 8 — Query Examples](#part-8--query-examples)
+13. [Part 9 — Maintaining the Knowledge Base](#part-9--maintaining-the-knowledge-base)
+14. [Limitations & Caveats](#limitations--caveats)
+
+---
+
+## Executive Summary
+
+The decision layer is a **rule-based expert system** that synthesizes six market
+models into one row per `(symbol, date)` containing: a directional signal, a
+certainty factor, and a human-readable explanation. It does not use machine learning.
+Instead, it encodes domain expertise as 36 explicit production rules in a decision
+table — a file any domain expert can edit without touching SQL.
+
+The process has four conceptual stages:
+
+| Stage | What it does | Gold models involved |
+|---|---|---|
+| **Propose** | Establishes a directional bias from technical indicators | `gold_technical_rating` |
+| **Protect** | Gates or blocks the proposal when market conditions are risky | `gold_volatility_index`, `gold_anomaly_flags` |
+| **Validate** | Adjusts conviction based on context and price extremes | `gold_52w_levels`, `gold_sector_performance` |
+| **Execute** | Provides entry-level timing context (output only, not a decision key) | `gold_intraday_vwap` |
+
+Every signal is accompanied by `why_signal`, `why_not_buy`, and `reasoning_trace` —
+embodying Explainable AI (XAI) principles so that any stakeholder can trace the
+decision back to the exact rule that fired.
+
+---
+
+## Conceptual Model: Propose → Protect → Validate
+
+Before diving into implementation, understand the three-layer reasoning that governs
+every signal. This model makes the decision logic transparent, teachable, and auditable.
 
 ```
-dbt/seeds/knowledge_rules.csv   ← Named Knowledge Base (edit to update rules)
-         │
-         ▼
-decision_cf_engine              ← Certainty Factor combination (§4.10)
-         │
-gold_anomaly_flags  ──────────┐
-gold_volatility_index ────────► decision_metarule_flags  ← Metarule evaluation (§4.2)
-                               │
-gold_technical_rating ─────────┤
-gold_52w_levels ───────────────┤
-gold_volatility_index ─────────► decision_signals  ← Signal + Explanation facility (§4.8–4.9)
-gold_anomaly_flags ────────────┤
-gold_sector_performance ───────┘
-
-         │
-         │  [Airflow DAG: decision_cbr_outcomes — daily]
-         │  reads decision_signals + silver_ohlcv, writes outcomes
-         ▼
-decision_case_outcomes          ← CBR case library (§7.8–7.10 Retain)
-         │
-         ├─► decision_cbr_lookup    ← CBR Retrieve + Reuse
-         └─► decision_validation    ← Accuracy, Reliability, Sensitivity (§4.11–4.12)
+┌──────────────────────────────────────────────────────────────────────┐
+│                        PROPOSE  (What to do)                         │
+│                                                                      │
+│  gold_technical_rating → rating: Strong Buy / Buy / Neutral /        │
+│                                  Sell / Strong Sell                  │
+│                                                                      │
+│  Eight indicators vote +1/0/−1. The net score maps to a categorical  │
+│  label. This is the base directional bias before any risk check.     │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        PROTECT  (Should we act?)                     │
+│                                                                      │
+│  gold_volatility_index → vol_level (high / extreme blocks BUY)       │
+│  gold_anomaly_flags    → has_price_anomaly (overrides to HOLD/SELL)  │
+│                                                                      │
+│  Risk gates that can cancel or reverse the proposal. High vol means  │
+│  entries are unsafe. Anomalies signal non-normal behaviour that may  │
+│  invalidate the technical read. If a protect condition fires, the     │
+│  signal is downgraded or blocked — regardless of the proposal.       │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │  (if protect passes or is overridden)
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                        VALIDATE  (How strongly?)                     │
+│                                                                      │
+│  gold_sector_performance → sector_ok (headwind / tailwind)           │
+│  gold_52w_levels        → at_52w_pos (near support / resistance)     │
+│                                                                      │
+│  These factors do not create a signal. They adjust the certainty     │
+│  factor up or down. A strong sector or a 52-week low increases BUY   │
+│  conviction; a weak sector or 52-week high decreases it or blocks.   │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │
+                              ▼
+                   Final SIGNAL + CF + explanation
 ```
 
+**How this maps to the decision table:** Every one of the 36 rules is labelled with
+its role in this model. Protect rules always take precedence over Validate rules when
+both apply to the same (symbol, date) — by design, safety overrides opportunity.
+
+| Role | Decision table condition | State IDs |
+|---|---|---|
+| **Propose** | `rating_group` | All rows |
+| **Protect** | `vol_level = high` or `extreme` | S01, S02, S08, S09, S15, S16, S22, S23, S29, S30 |
+| **Protect** | `has_anomaly = true` | S03, S10, S17, S24, S31 |
+| **Validate** | `sector_ok = false` | S04, S11, S18, S25, S32 |
+| **Validate** | `at_52w_pos = near_low` or `near_high` | S05, S06, S12, S13, S19, S20, S26, S27, S33, S34 |
+| **Default** | No special conditions | S07, S14, S21, S28, S35 |
+
 ---
 
-## Part 1 — Gold Layer Inputs
-
-### Step 1 — Technical Rating (8 indicators)
-
-`gold_technical_rating` computes a **vote** of +1 (buy), 0 (neutral), or −1 (sell) for each of eight indicators. The votes are summed into a `signal_score` ranging from −8 to +8.
-
-#### Moving Averages
-
-All SMAs are simple (un-weighted) averages of the closing price over the trailing N days.
-
-$$\text{SMA}_N = \frac{1}{N} \sum_{i=0}^{N-1} \text{close}_{t-i}$$
-
-| # | Indicator | Buy vote (+1) | Sell vote (−1) |
-|---|---|---|---|
-| 1 | Price vs SMA10 | close > SMA10 | close < SMA10 |
-| 2 | Price vs SMA20 | close > SMA20 | close < SMA20 |
-| 3 | Price vs SMA50 | close > SMA50 | close < SMA50 |
-| 4 | Price vs SMA200 | close > SMA200 | close < SMA200 |
-| 5 | SMA10 / SMA20 cross | SMA10 > SMA20 (golden cross) | SMA10 < SMA20 (death cross) |
-
-#### RSI(14)
-
-$$\text{RS} = \frac{\text{Avg gain}_{14d}}{\text{Avg loss}_{14d}} \qquad \text{RSI} = 100 - \frac{100}{1 + \text{RS}}$$
-
-| # | Indicator | Buy vote | Sell vote |
-|---|---|---|---|
-| 6 | RSI(14) | RSI < 30 — oversold | RSI > 70 — overbought |
-
-#### Bollinger Bands
-
-$$\text{BB}_{\text{upper}} = \text{SMA}_{20} + 2\,\sigma_{20} \qquad \text{BB}_{\text{lower}} = \text{SMA}_{20} - 2\,\sigma_{20}$$
-
-| # | Indicator | Buy vote | Sell vote |
-|---|---|---|---|
-| 7 | Bollinger Band position | close < BB_lower | close > BB_upper |
-
-#### MACD Proxy (SMA12 / SMA26)
-
-| # | Indicator | Buy vote | Sell vote |
-|---|---|---|---|
-| 8 | MACD proxy | SMA12 > SMA26 | SMA12 < SMA26 |
-
-#### Score → Rating Label
+## System Architecture
 
 ```
-signal_score = Σ votes  (range: −8 to +8)
-
- 5 to  8  →  Strong Buy
- 3 to  4  →  Buy
-−2 to  2  →  Neutral
-−4 to −3  →  Sell
-−8 to −5  →  Strong Sell
+┌────────────────────────────────────────────────────────────────────────┐
+│                        GOLD LAYER  (6 feature models)                  │
+│  Each model runs daily and produces a table of (symbol, date, features) │
+├────────────────────────────────────────────────────────────────────────┤
+│  gold_technical_rating   → signal_score, rating, RSI, SMAs, BB        │
+│  gold_volatility_index   → annualized_vol, vol_level                   │
+│  gold_anomaly_flags      → has_price_anomaly, has_volume_anomaly       │
+│  gold_52w_levels         → at_52w_high, at_52w_low, pct_from_high/low │
+│  gold_sector_performance → sector_advance_ratio, sector_ok             │
+│  gold_intraday_vwap      → session_vwap                                │
+└────────────────────────────────────┬───────────────────────────────────┘
+                                     │  All six joined in one SQL model
+                                     ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│              KNOWLEDGE BASE: dbt/seeds/decision_table.csv              │
+│  36 production rules — each row: IF conditions THEN signal, CF         │
+│  Example: IF rating='Strong Buy' AND anomaly=false AND sector_ok=true  │
+│           AND vol='normal' AND at_52w='near_low' THEN BUY, CF=+0.92   │
+└────────────────────────────────────┬───────────────────────────────────┘
+                                     │  Specificity-ordered lookup
+                                     ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   decision_signals  (single unified output table)       │
+│  • signal (BUY / SELL / HOLD)                                          │
+│  • signal_cf (−1.0 to +1.0) and confidence (HIGH / MEDIUM / LOW)      │
+│  • state_id (which rule fired)                                         │
+│  • why_signal, why_not_buy, why_not_sell, reasoning_trace  (XAI)      │
+│  • All gold layer context columns (for auditing and explanation)       │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+**Knowledge representation techniques used (Lecture 4):**
 
-### Step 2 — Anomaly Detection
-
-`gold_anomaly_flags` flags two anomalies per stock per day, pivoted in `decision_signals` into `has_price_anomaly` and `has_volume_anomaly`.
-
-#### Volume Z-score
-
-$$z = \frac{V_t - \bar{V}_{30d}}{\sigma_{V,30d}}$$
-
-**Flags** when $|z| > 2.5$ (abnormal trading activity).
-
-#### Price IQR (daily log-return)
-
-$$r_t = \ln\!\left(\frac{\text{close}_t}{\text{close}_{t-1}}\right)$$
-
-$$\text{lower} = Q_1 - 1.5 \times (Q_3 - Q_1) \qquad \text{upper} = Q_3 + 1.5 \times (Q_3 - Q_1)$$
-
-**Flags** when $r_t < \text{lower}$ or $r_t > \text{upper}$ (Tukey outlier, trailing 90-day window).
+| Technique | Where | § |
+|---|---|---|
+| **Decision table** | `decision_table.csv` — 36 IF-THEN rules with CF | §4.7 Formal Logic |
+| **Decision tree** | `signal_score → rating` — 5-branch CASE in SQL | §4.7 Formal Logic |
+| **Production rules** | Each row of the decision table is a named production rule | §4.1 |
+| **Certainty Factors** | `signal_cf` column — formal uncertainty (−1.0 to +1.0) | §4.10 |
 
 ---
 
-### Step 3 — 52-Week Level Proximity
+## Why a Decision Layer?
 
-$$\text{high}_{52w} = \max(\text{high}_{t-251}, \ldots, \text{high}_t) \qquad \text{low}_{52w} = \min(\text{low}_{t-251}, \ldots, \text{low}_t)$$
+The six gold models each provide a narrow slice of information: trend, volatility,
+anomalies, 52-week proximity, sector strength, VWAP. None alone is sufficient for a
+good trading decision.
 
-$$\text{pct\_from\_high} = \frac{\text{close} - \text{high}_{52w}}{\text{high}_{52w}} \quad \text{pct\_from\_low} = \frac{\text{close} - \text{low}_{52w}}{\text{low}_{52w}}$$
-
-Proximity flags (within 2%): `at_52w_high` and `at_52w_low`. These appear in the explanation string and provide context but do not override the signal.
-
----
-
-### Step 4 — Volatility
-
-$$\text{annualized\_vol} = \sigma_{20d} \times \sqrt{252}$$
-
-where $\sigma_{20d}$ is the rolling 20-day standard deviation of log-returns. High volatility (> 50% annualised) appears in the explanation. Values > 80% trigger the G03 gate (see Step 7).
+The decision layer **integrates** these slices using an explicit knowledge base. This
+is **knowledge-based systems (KBS) in production**: every signal traces to a specific
+rule, every certainty factor is pre-assigned by an expert, and the logic can be
+updated without retraining models. A pure ML classifier would require thousands of
+labelled examples, and its decisions would be unauditable — the opposite of what a
+KBS demands.
 
 ---
 
-### Step 5 — Sector Confirmation
+## Part 1 — The Six Gold Layer Models
 
-$$\text{advance\_ratio} = \frac{\text{\# stocks with positive daily return}}{\text{\# stocks in sector}}$$
-
-A value ≥ 0.5 means the sector is broadly advancing. Values < 0.5 trigger the G02 gate.
+Each gold model exists because it captures one distinct kind of market evidence. The
+decision layer reads their ready-made outputs — it does not recompute anything.
 
 ---
 
-## Part 2 — Decision Layer Processing
+### 1.1 `gold_technical_rating` — Propose
 
-### Step 6 — Named Knowledge Base
+**Role:** **PROPOSE** — provides the base directional bias before any risk or context
+check is applied.
 
-`dbt/seeds/knowledge_rules.csv` is the explicit Knowledge Base. Each row is a named rule with a certainty factor (CF). This is the **Knowledge Acquisition interface** — domain experts edit this CSV and run `dbt seed` to update the system without touching SQL.
+#### Why it exists
+A single price number does not reveal whether the market is trending upward,
+weakening, overbought, or at a statistical extreme. Technical indicators condense
+price history into a consistent directional summary.
 
-| rule_id | rule_name | category | CF | What it asserts |
+#### Why it is used
+The decision table needs a coarse but meaningful measure of direction. Rather than
+inspecting eight raw indicators one by one, it only needs the rating group: `Strong
+Buy`, `Buy`, `Neutral`, `Sell`, or `Strong Sell`.
+
+#### Why this matters
+This model is the system's **first filter for directional bias**. It tells the decision
+layer whether the stock is attractive, uncertain, or weak — before any risk gate is
+applied. Everything else modifies this base proposal.
+
+#### Technical voting logic
+
+Each of 8 indicators casts a vote: +1 (bullish), 0 (neutral), −1 (bearish).
+
+| Rule | Indicator | Buy vote (+1) | Sell vote (−1) |
+|---|---|---|---|
+| R01 | Price vs SMA10 | close > SMA10 | close < SMA10 |
+| R02 | Price vs SMA20 | close > SMA20 | close < SMA20 |
+| R03 | Price vs SMA50 | close > SMA50 | close < SMA50 |
+| R04 | Price vs SMA200 | close > SMA200 | close < SMA200 |
+| R05 | MA cross | SMA10 > SMA20 (golden cross) | SMA10 < SMA20 (death cross) |
+| R06 | RSI(14) | RSI < 30 — oversold | RSI > 70 — overbought |
+| R07 | Bollinger Bands | close < BB\_lower | close > BB\_upper |
+| R08 | MACD proxy | SMA12 > SMA26 | SMA12 < SMA26 |
+
+#### Score-to-rating mapping (decision tree, §4.7)
+
+```
+signal_score = Σ votes   (range: −8 to +8)
+
+signal_score ≥ +5  →  Strong Buy
+signal_score ≥ +3  →  Buy
+signal_score ≤ −5  →  Strong Sell
+signal_score ≤ −3  →  Sell
+otherwise          →  Neutral
+```
+
+This 5-branch mapping is a **decision tree** (§4.7 Formal Logic): it compresses the
+continuous score into a categorical label used as the primary key in the decision table.
+
+#### Key columns used downstream
+
+| Column | Purpose in decision layer |
+|---|---|
+| `rating` | **Primary decision-table key** — one of 5 categories |
+| `signal_score` | Used in the anomaly SELL override condition |
+| `buy_signals`, `sell_signals` | Explanation output ("6/8 indicators bullish") |
+| `rsi14`, `sma50`, `sma200`, `bb_lower`, `bb_upper` | Context for human-readable explanations |
+
+---
+
+### 1.2 `gold_volatility_index` — Protect (Risk Gate)
+
+**Role:** **PROTECT** — gates or blocks the proposal when risk is too high.
+
+#### Why it exists
+A stock can look attractive technically but still be too dangerous to enter if its
+recent price swings are extreme. Volatility is **risk**, not direction.
+
+#### Why it is used
+Volatility acts as a **risk gate**. It does not tell you whether the stock will go up
+or down. It tells you whether the environment is calm enough to trust a directional
+signal. High volatility means wider spreads, more slippage, and higher probability of
+stop-loss hits from normal noise.
+
+#### Why this matters
+This model protects the system from overconfident entries during chaotic conditions.
+A stock with 80% annualised volatility can gap 5% overnight. Entering a position based
+on technical indicators in that environment is like trying to park on a trampoline.
+The volatility gate exists precisely to prevent this.
+
+#### Definition
+
+$$r_t = \ln\!\left(\frac{\text{close}_t}{\text{close}_{t-1}}\right) \qquad \text{annualized\_vol} = \sigma_{20d} \times \sqrt{252}$$
+
+where $\sigma_{20d}$ is the rolling 20-day standard deviation of log-returns.
+
+#### Volatility classification (decision key: `vol_level`)
+
+| `annualized_vol` | `vol_level` | Approximate daily swing | Protection effect |
+|---|---|---|---|
+| > 80% | `extreme` | > 5% per day | Blocks BUY entirely; SELL CF slightly reduced (panic reversal risk) |
+| > 50% | `high` | > 3% per day | Reduces BUY conviction; often forces HOLD |
+| 20%–50% | `normal` | 1.2%–3% per day | Standard environment — allows full BUY/SELL |
+| ≤ 20% | `low` | < 1.2% per day | Highest confidence for directional trades |
+
+---
+
+### 1.3 `gold_anomaly_flags` — Protect (Outlier Gate)
+
+**Role:** **PROTECT** — overrides the proposal when price or volume behaviour is
+statistically abnormal.
+
+#### Why it exists
+Technical indicators are calibrated on normal market behaviour. An anomalous day
+(crash, spike, news event, data error) violates the assumptions underlying those
+indicators. Acting on a technical signal during an anomaly is like navigating with a
+compass near a magnet.
+
+#### Why it is used
+Anomalies represent events where price action is **not informationally reliable**. A
+sudden 10% drop may be a genuine breakdown — or it may be a flash crash that reverts
+within hours. Rather than trying to distinguish the two in real time, the system
+treats `has_price_anomaly = true` as a **caution flag**: it blocks BUY, and if
+combined with a negative score, it triggers SELL.
+
+#### Why this matters
+Without anomaly detection, the system would happily issue a BUY signal immediately
+after a stock spikes up on unusual volume — exactly the moment most likely to be
+followed by mean reversion. The anomaly gate prevents this.
+
+#### Two independent detectors
+
+**Volume Z-score (30-day rolling):**
+$$z = \frac{V_t - \bar{V}_{30d}}{\sigma_{V,30d}} \qquad \text{flagged if } |z| > 2.5$$
+
+**Price IQR / Tukey fence (90-day trailing log-returns):**
+$$\text{lower} = Q_1 - 1.5 \times IQR \qquad \text{upper} = Q_3 + 1.5 \times IQR$$
+Flagged when the daily log-return falls outside `[lower, upper]`.
+
+#### Key columns used downstream
+
+| Column | Role |
+|---|---|
+| `has_price_anomaly` | **Decision key** — blocks BUY; triggers SELL override with negative score |
+| `has_volume_anomaly` | Passed through to output for explanation and auditing |
+
+---
+
+### 1.4 `gold_52w_levels` — Validate (Position Context)
+
+**Role:** **VALIDATE** — adjusts conviction based on support and resistance proximity.
+
+#### Why it exists
+Price extremes are **psychological anchors**. The 52-week high and low represent the
+range within which a stock has traded over the past year. Proximity to these levels
+carries predictive meaning that raw technical indicators do not capture.
+
+#### Why it is used
+The 52-week position fine-tunes conviction **after** the proposal and protection
+stages pass. It answers the question: *"Even if we should buy, is this a particularly
+good or bad price level to enter?"*
+
+#### Why this matters
+Near a 52-week low, mean-reversion traders expect a bounce — this is among the most
+reliable setups in technical analysis. The decision table reflects this: a Strong Buy
+near the 52-week low gets CF=+0.92 (the highest in the table), while the same rating
+near the 52-week high gets CF=+0.72. Conversely, for SELL signals, a stock near its
+52-week low has potential support that reduces sell conviction (S26, CF=−0.52), while
+a breakdown from a 52-week high is more likely to persist (S27, CF=−0.82).
+
+#### Definition
+
+$$\text{high}_{52w} = \max(\text{high}_{t-251},\ldots,\text{high}_t) \qquad \text{low}_{52w} = \min(\text{low}_{t-251},\ldots,\text{low}_t)$$
+
+Proximity flags (within 2% of extreme): `at_52w_high`, `at_52w_low`.
+
+#### Decision key mapping (`at_52w_pos`)
+
+| Condition | `at_52w_pos` | Validation effect on BUY | Validation effect on SELL |
+|---|---|---|---|
+| `at_52w_low = true` | `near_low` | **Boosts CF** — mean reversion opportunity | **Reduces CF** — potential support/bounce |
+| `at_52w_high = true` | `near_high` | **Reduces CF** — resistance zone | **Boosts CF** — confirmed breakdown from peak |
+| Neither | `neutral` | No adjustment | No adjustment |
+
+---
+
+### 1.5 `gold_sector_performance` — Validate (Market Context)
+
+**Role:** **VALIDATE** — confirms or contradicts the proposal based on broad sector
+strength.
+
+#### Why it exists
+Even the best stock can struggle when its whole sector is declining. A rising tide
+lifts most boats; a falling tide drops them regardless of individual quality.
+
+#### Why it is used
+Sector performance is the **macro context check**. If a stock shows a Buy signal but
+80% of its sector is declining today, something is likely wrong — either the stock is
+special, or the technical signal is noise. The decision table conservatively blocks
+BUY when `sector_ok = false`, requiring the sector to confirm the individual signal.
+
+#### Why this matters
+Without sector validation, the system would issue BUY signals into sector-wide
+selloffs. With it, a Buy-rated stock that is fighting against a declining sector is
+downgraded to HOLD — a more defensible and empirically sounder position.
+
+#### Definition
+
+$$\text{advance\_ratio} = \frac{\text{\# stocks in sector with positive daily return}}{\text{\# total stocks in sector}}$$
+
+$$\text{sector\_ok} = (\text{advance\_ratio} \ge 0.5)$$
+
+**Effect on decision table:**
+- `sector_ok = false` → BUY is blocked (S04, S11, S18); SELL is strengthened (S25, CF=−0.75)
+- `sector_ok = true` → no constraint added; validate rules (S05–S07 etc.) apply normally
+
+---
+
+### 1.6 `gold_intraday_vwap` — Execution Timing
+
+**Role:** **Not a decision key.** Included in the output for informational purposes only.
+
+#### Why it exists
+VWAP (Volume-Weighted Average Price) represents the average price at which the
+market has transacted throughout the session. It is the reference price used by
+institutional order desks to evaluate execution quality.
+
+#### Why it is not a decision key
+The decision table answers *"what to do"* — direction and conviction. VWAP answers
+*"when to execute"* — entry timing. These are different questions. A BUY signal means
+the system judges the stock worth buying; VWAP tells a human trader whether to buy
+now or wait for a dip toward VWAP for a better average cost.
+
+#### Why this matters
+Including VWAP in the output allows downstream users to enrich the signal without
+baking timing logic into the decision layer itself — preserving the separation between
+*deciding* and *executing*.
+
+#### Definition
+
+$$\text{VWAP} = \frac{\sum_t \text{price}_t \times \text{volume}_t}{\sum_t \text{volume}_t}$$
+
+`session_vwap` is `NULL` for days with no tick data (batch-only historical loads).
+During market hours (Sun–Thu 10:00–15:00 Riyadh time), the Kafka tick stream provides
+updates via Spark Structured Streaming.
+
+---
+
+## Part 2 — The Decision Table (Knowledge Base)
+
+### 2.1 Why a Decision Table Instead of Pure ML?
+
+| Aspect | Decision Table (KBS) | Pure ML Classifier |
+|---|---|---|
+| **Explainability** | Every signal traces to a specific named rule | Black box — per-instance reasoning is invisible |
+| **Editable by domain expert** | Edit CSV, run `dbt seed` — no code | Requires retraining, relabelling, ML engineering |
+| **Certainty factors** | Explicitly assigned from expert judgment | Requires probabilistic calibration from data |
+| **Performance with sparse history** | Works with any amount of data | Needs thousands of labelled examples |
+| **Guaranteed behaviour** | No unintended interactions — rules are independent | May learn spurious correlations in training data |
+| **Tie-breaking** | Explicit specificity ordering — fully deterministic | Implicit and hard to debug |
+
+**Trade-off:** The decision table cannot learn complex non-linear interactions beyond
+the 5-dimensional condition space. But for this domain — combining a handful of
+categorical market features — a well-designed decision table is **interpretable,
+editable, and sufficient**.
+
+---
+
+### 2.2 Certainty Factors: Quantifying Judgment (§4.10)
+
+A **certainty factor (CF)** is a number between −1.0 and +1.0 that encodes both the
+**direction** and the **strength of belief** in a signal. This follows Lecture 4
+§4.10 (Certainty Factors), where belief and disbelief are represented as independent
+signed values that can be combined.
+
+```
+  −1.0         −0.65      −0.40          0         +0.40      +0.65          +1.0
+    │             │          │            │            │          │             │
+    └─ HIGH SELL ─┘  MED SELL   ──── LOW / HOLD ────   MED BUY    └─ HIGH BUY ─┘
+  (maximum conviction)            (weak or no signal)          (maximum conviction)
+```
+
+| \|CF\| range | `confidence` | What it means in practice |
+|---|---|---|
+| ≥ 0.65 | **HIGH** | Strong conviction — suitable for position sizing |
+| 0.40–0.64 | **MEDIUM** | Notable signal but with meaningful uncertainty |
+| < 0.40 | **LOW** | Weak conviction — lean toward holding; avoid new positions |
+
+**Why CF instead of binary BUY/SELL/HOLD?**
+CF allows **ranking** within a signal type. Two BUY signals — CF=0.92 and CF=0.55 —
+are both BUY, but the former is more actionable. CF also provides a smooth transition:
+a rule that almost blocks BUY can express +0.18 (slight positive lean) rather than
+forcing a flat 0.00 HOLD, preserving nuance without inventing extra signal categories.
+
+**How CF values were assigned:** They encode the propose-protect-validate framework:
+
+- **+0.92 (S05, Strong Buy + near_low):** Full proposal (Strong Buy) + all protections pass + strong validation (near 52W low). Maximum BUY.
+- **+0.22 (S01, Strong Buy + high vol):** Good proposal but volatility gate fires. Positive lean (technicals still strong) but BUY blocked.
+- **−0.12 (S02, Strong Buy + extreme vol):** Extreme volatility turns the CF negative — entering here could result in a gap loss.
+- **−0.95 (S31, Strong Sell + anomaly):** Strongest SELL: maximum negative proposal + protect confirmation. No context can reverse this.
+- **−0.52 (S26, Sell + near_low):** SELL signal but near a 52-week low that might provide support. Reduced conviction.
+
+---
+
+### 2.3 The 36 Production Rules
+
+The table is organised as **5 rating groups × 7 scenarios + 1 fallback**.
+Every group covers the same 7 scenarios, ensuring symmetric coverage:
+
+| Scenario # | Condition | Role | State IDs |
+|---|---|---|---|
+| 1 | `vol_level = high` | **Protect** | S01, S08, S15, S22, S29 |
+| 2 | `vol_level = extreme` | **Protect** | S02, S09, S16, S23, S30 |
+| 3 | `has_anomaly = true` | **Protect** | S03, S10, S17, S24, S31 |
+| 4 | `sector_ok = false` | **Validate** | S04, S11, S18, S25, S32 |
+| 5 | `at_52w_pos = near_low` | **Validate** | S05, S12, S19, S26, S33 |
+| 6 | `at_52w_pos = near_high` | **Validate** | S06, S13, S20, S27, S34 |
+| 7 | Default (no special conditions) | — | S07, S14, S21, S28, S35 |
+
+**Fallback S36:** All conditions `any` → HOLD, CF=0.00. Guarantees every row matches.
+
+**Full rule table (with role labels — see `decision_table.csv` for exact values):**
+
+| State | Rating | Anomaly | Sector | Vol | 52W | Signal | CF | Conf | Role |
+|---|---|---|---|---|---|---|---|---|---|
+| S01 | Strong Buy | false | true | high | any | HOLD | +0.22 | LOW | Protect (vol) |
+| S02 | Strong Buy | false | true | extreme | any | HOLD | −0.12 | LOW | Protect (vol) |
+| S03 | Strong Buy | true | any | any | any | HOLD | −0.20 | LOW | Protect (anomaly) |
+| S04 | Strong Buy | false | false | any | any | HOLD | +0.12 | LOW | Validate (sector) |
+| S05 | Strong Buy | false | true | any | near\_low | **BUY** | **+0.92** | HIGH | Validate (52W) |
+| S06 | Strong Buy | false | true | any | near\_high | **BUY** | +0.72 | HIGH | Validate (52W) |
+| S07 | Strong Buy | false | true | any | any | **BUY** | +0.88 | HIGH | Default |
+| S08 | Buy | false | true | high | any | HOLD | +0.18 | LOW | Protect (vol) |
+| S09 | Buy | false | true | extreme | any | HOLD | −0.12 | LOW | Protect (vol) |
+| S10 | Buy | true | any | any | any | HOLD | −0.28 | LOW | Protect (anomaly) |
+| S11 | Buy | false | false | any | any | HOLD | 0.00 | LOW | Validate (sector) |
+| S12 | Buy | false | true | any | near\_low | **BUY** | +0.80 | HIGH | Validate (52W) |
+| S13 | Buy | false | true | any | near\_high | **BUY** | +0.55 | MEDIUM | Validate (52W) |
+| S14 | Buy | false | true | any | any | **BUY** | +0.70 | HIGH | Default |
+| S15 | Neutral | false | true | high | any | HOLD | −0.10 | LOW | Protect (vol) |
+| S16 | Neutral | false | true | extreme | any | HOLD | −0.18 | LOW | Protect (vol) |
+| S17 | Neutral | true | any | any | any | HOLD | −0.20 | LOW | Protect (anomaly) |
+| S18 | Neutral | false | false | any | any | HOLD | −0.08 | LOW | Validate (sector) |
+| S19 | Neutral | false | true | any | near\_low | HOLD | +0.12 | LOW | Validate (52W) |
+| S20 | Neutral | false | true | any | near\_high | HOLD | −0.08 | LOW | Validate (52W) |
+| S21 | Neutral | any | any | any | any | HOLD | 0.00 | LOW | Default |
+| S22 | Sell | false | true | high | any | **SELL** | −0.68 | HIGH | Protect (vol) |
+| S23 | Sell | false | true | extreme | any | **SELL** | −0.60 | MEDIUM | Protect (vol) |
+| S24 | Sell | true | any | any | any | **SELL** | −0.85 | HIGH | Protect (anomaly) |
+| S25 | Sell | false | false | any | any | **SELL** | −0.75 | HIGH | Validate (sector) |
+| S26 | Sell | false | true | any | near\_low | **SELL** | −0.52 | MEDIUM | Validate (52W) |
+| S27 | Sell | false | true | any | near\_high | **SELL** | −0.82 | HIGH | Validate (52W) |
+| S28 | Sell | any | any | any | any | **SELL** | −0.70 | HIGH | Default |
+| S29 | Strong Sell | false | true | high | any | **SELL** | −0.80 | HIGH | Protect (vol) |
+| S30 | Strong Sell | false | true | extreme | any | **SELL** | −0.72 | HIGH | Protect (vol) |
+| S31 | Strong Sell | true | any | any | any | **SELL** | **−0.95** | HIGH | Protect (anomaly) |
+| S32 | Strong Sell | false | false | any | any | **SELL** | −0.88 | HIGH | Validate (sector) |
+| S33 | Strong Sell | false | true | any | near\_low | **SELL** | −0.68 | HIGH | Validate (52W) |
+| S34 | Strong Sell | false | true | any | near\_high | **SELL** | **−0.92** | HIGH | Validate (52W) |
+| S35 | Strong Sell | any | any | any | any | **SELL** | −0.90 | HIGH | Default |
+| S36 | any | any | any | any | any | HOLD | 0.00 | LOW | Fallback |
+
+---
+
+### 2.4 Specificity-Based Rule Matching
+
+**The problem:** Multiple rules may match the same `(symbol, date)`. For example, a
+stock with `Strong Buy, no anomaly, sector_ok, high vol, near_low` matches both:
+- S01 (vol=high gate) — conditions: rating, anomaly=false, sector=true, vol=high, 52W=any
+- S05 (near_low differentiator) — conditions: rating, anomaly=false, sector=true, vol=any, 52W=near_low
+
+Both have **4 non-`any` conditions**. Which rule should win?
+
+**Resolution:** Select the row with the highest `specificity_score`. On a tie, the
+**lower `state_id`** wins.
+
+```
+specificity_score = count(condition ≠ 'any')
+                  = (rating_group ≠ 'any') + (has_anomaly ≠ 'any')
+                  + (sector_ok ≠ 'any') + (vol_level ≠ 'any') + (at_52w_pos ≠ 'any')
+```
+
+**Why lower state_id wins on a tie:** Within each rating group, gate rows (S01–S04,
+S08–S11, etc.) have lower state_ids than differentiator rows (S05–S07, S12–S14, etc.).
+This means **volatility and anomaly gates take precedence over 52-week proximity**.
+That is intentional: **risk management (protect) overrides opportunity (validate)**.
+
+**Tie-breaking examples:**
+
+| Input conditions | Matching rules | Specificities | Winner | Reason |
 |---|---|---|---|---|
-| R01 | price_above_sma10 | inference | 0.30 | close > SMA10 → buy vote |
-| R02 | price_above_sma20 | inference | 0.40 | close > SMA20 → buy vote |
-| R03 | price_above_sma50 | inference | 0.50 | close > SMA50 → buy vote |
-| R04 | price_above_sma200 | inference | 0.60 | close > SMA200 → buy vote (most reliable) |
-| R05 | golden_cross | inference | 0.50 | SMA10 > SMA20 → buy vote |
-| R06 | rsi_oversold | inference | 0.70 | RSI < 30 → buy vote (highest CF) |
-| R07 | bollinger_lower_touch | inference | 0.60 | close < BB_lower → buy vote |
-| R08 | macd_bullish_proxy | inference | 0.40 | SMA12 > SMA26 → buy vote |
-| G01 | no_price_anomaly_gate | knowledge | 1.00 | price anomaly → BLOCK_BUY |
-| G02 | sector_advance_gate | knowledge | 0.80 | advance_ratio < 50% → BLOCK_BUY |
-| G03 | high_volatility_gate | knowledge | 0.90 | ann. vol > 80% → BLOCK_BUY |
-| M01 | market_anomaly_metarule | metarule | 0.90 | market anomaly rate > 30% → TIGHTEN_BUY (require score ≥ 6) |
-| M02 | consecutive_down_metarule | metarule | 0.80 | 3 consecutive down days → BLOCK_BUY |
+| Strong Buy + high vol + near_low | S01 (vol=high), S05 (near_low) | 4, 4 | **S01** | Lower ID → protect wins over validate |
+| Strong Buy + normal vol + near_low | S05 only (S01 vol=high doesn't match) | 4 | **S05** | Only match |
+| Strong Buy + anomaly + near_low | S03 (anomaly=true), S05 (anomaly=false → no match) | 2 | **S03** | Only match; S05 requires anomaly=false |
+| Strong Buy + no anomaly + sector_fail + near_low | S04 (sector=false), S05 (sector=true → no match) | 3 | **S04** | Only match; S05 requires sector_ok=true |
 
-CFs are assigned based on empirical reliability from technical analysis literature (Murphy, Wilder, Bollinger). Higher CF = stronger belief in the rule's validity.
-
----
-
-### Step 7 — Certainty Factor Combination
-
-`decision_cf_engine` applies the CF combination formula iteratively across all 8 inference rules, producing a single `combined_cf` score per (symbol, date).
-
-Each rule contributes a **signed CF**: `vote × certainty_factor`. A BUY vote gives `+CF`, a SELL vote gives `−CF`, and a neutral vote gives `0`.
-
-The combination formula (applied once per pair, iterated 7 times for 8 rules):
-
-$$\text{CF}(A, B) = \begin{cases} A + B(1-A) & \text{if } A \geq 0 \text{ and } B \geq 0 \quad \text{(reinforcing positive)} \\ A + B(1+A) & \text{if } A \leq 0 \text{ and } B \leq 0 \quad \text{(reinforcing negative)} \\ \dfrac{A + B}{1 - \min(|A|, |B|)} & \text{otherwise} \quad \text{(conflicting evidence)} \end{cases}$$
-
-**Worked example** — all 8 indicators vote BUY:
-
-| Step | Rule added | CF before | CF after |
-|---|---|---|---|
-| 1 | R01 (cf=+0.30) | — | +0.30 |
-| 2 | R02 (cf=+0.40) | +0.30 | 0.30 + 0.40×(1−0.30) = **+0.58** |
-| 3 | R03 (cf=+0.50) | +0.58 | 0.58 + 0.50×(1−0.58) = **+0.79** |
-| 4 | R04 (cf=+0.60) | +0.79 | 0.79 + 0.60×(1−0.79) = **+0.916** |
-| 5 | R05 (cf=+0.50) | +0.916 | 0.916 + 0.50×(1−0.916) = **+0.958** |
-| 6 | R06 (cf=+0.70) | +0.958 | 0.958 + 0.70×(1−0.958) = **+0.987** |
-| 7 | R07 (cf=+0.60) | +0.987 | 0.987 + 0.60×(1−0.987) = **+0.995** |
-| 8 | R08 (cf=+0.40) | +0.995 | 0.995 + 0.40×(1−0.995) = **+0.997** |
-
-The `combined_cf` ranges from −1.0 (maximum sell conviction) to +1.0 (maximum buy conviction).
-
-**Confidence mapping:**
+**Implicit priority hierarchy:**
 
 ```
-|combined_cf| ≥ 0.65  →  HIGH
-|combined_cf| ≥ 0.40  →  MEDIUM
-|combined_cf| <  0.40 →  LOW
+1. Protect rules (vol=high/extreme, anomaly=true)  — specificity 4, lower state_id
+2. Validate rules (sector=false, near_low, near_high) — specificity 3-4, higher state_id
+3. Default rules (no special conditions)           — specificity 1-3
+4. Fallback (S36)                                  — specificity 0
 ```
 
 ---
 
-### Step 8 — Metarule Evaluation
-
-`decision_metarule_flags` evaluates three higher-order rules that can override or tighten the inference engine output.
-
-#### M01 — Market-Wide Anomaly (Tighten)
-
-$$\text{market\_anomaly\_rate} = \frac{\text{\# symbols with price-IQR anomaly today}}{\text{\# total symbols}}$$
-
-If rate > 0.30 (> 30% of the market is anomalous), the BUY threshold is raised from `signal_score ≥ 3` to `signal_score ≥ 6`. Rationale: a broad anomaly day indicates market regime instability — only very high-conviction BUY signals should proceed.
-
-#### M02 — Consecutive Down-Day (Block)
-
-$$\text{down\_days\_3d} = \sum_{i=0}^{2} \mathbb{1}[r_{t-i} < -0.02]$$
-
-If a symbol has had 3 consecutive trading days with log-return < −2%, sustained selling pressure is present. BUY is blocked regardless of technical rating.
-
-#### G03 — Extreme Volatility (Block)
-
-If `annualized_vol > 0.80` (80%), the position risk is too high to enter a BUY trade.
-
-**Metarule output columns** (in `decision_metarule_flags` and passed to `decision_signals`):
-
-| Column | Meaning |
-|---|---|
-| `m01_tighten_buy` | BOOLEAN — M01 fired |
-| `m02_consecutive_down` | BOOLEAN — M02 fired |
-| `g03_extreme_volatility` | BOOLEAN — G03 fired |
-| `active_metarules` | Space-separated list of fired IDs, e.g. `"M01 G03"` |
-| `required_score_for_buy` | 3 normally; 6 when M01 fires |
-
----
-
-### Step 9 — Final Signal Logic
-
-`decision_signals` combines all inputs in the following order of precedence:
+### 2.5 Rule Selection Flow
 
 ```
-IF  technical rating ∈ {Buy, Strong Buy}
-AND has_price_anomaly = FALSE             ← gate G01: no anomalous spike
-AND sector_advance_ratio ≥ 0.50          ← gate G02: sector is net-positive
-AND signal_score ≥ required_score_for_buy ← M01 metarule: 3 normally, 6 if market anomalous
-AND g03_extreme_volatility = FALSE        ← gate G03: volatility ≤ 80%
-AND m02_consecutive_down = FALSE          ← M02 metarule: no 3-day down streak
-→  BUY
-
-ELSE IF  technical rating ∈ {Sell, Strong Sell}
-      OR (has_price_anomaly = TRUE AND signal_score < 0)
-→  SELL
-
-ELSE
-→  HOLD
-```
-
-**Gate / metarule rationale:**
-
-| Rule | Why |
-|---|---|
-| G01 no price anomaly | An IQR upside outlier is often a one-day spike before mean reversion. Buying into it is high-risk. |
-| G02 sector advance ≥ 50% | Individual signals carry lower conviction when the whole sector is declining (macro headwind). |
-| M01 tighten on market anomaly | If > 30% of the market is anomalous, only the strongest setups (score ≥ 6) should proceed. |
-| G03 extreme volatility | Annualised vol > 80% means daily price swings of ~5%. Position sizing becomes unsafe. |
-| M02 consecutive down days | 3 consecutive −2% days indicate a trend, not noise. Buying into a falling knife contradicts mean-reversion logic. |
-| Anomaly + negative score → SELL | A price breakdown (anomaly) coinciding with technical weakness (negative score) is a compounded bearish signal. |
-
----
-
-### Step 10 — Explanation Facility
-
-`decision_signals` exposes four explanation columns per row.
-
-#### `why_signal` — Why this signal was given
-
-| Signal | Example output |
-|---|---|
-| BUY | `"BUY: Buy rating (CF=0.72, score=+4/8) + no price anomaly + sector advance=62%"` |
-| SELL | `"SELL: Strong Sell rating (score=-6/8)"` |
-| SELL (anomaly path) | `"SELL: price-IQR anomaly with negative signal score (-2)"` |
-| HOLD | `"HOLD: Buy rating (CF=0.51, score=+3/8) — insufficient conditions for BUY or SELL"` |
-
-#### `why_not_buy` — Why BUY was not triggered (NULL when signal = BUY)
-
-The column cascades through gates in order and reports the **first** one that failed:
-
-```
-1. Rating not Buy/Strong Buy  → "BUY not triggered: rating is 'Neutral' (score=1/8, requires Buy or Strong Buy)"
-2. Price anomaly              → "BUY blocked by gate G01: price-IQR anomaly detected"
-3. Sector advance < 50%       → "BUY blocked by gate G02: sector advance 43% < 50% threshold"
-4. M01 tightened, score low   → "BUY blocked by metarule M01: market-wide anomaly rate >30% requires score≥6, current score=4"
-5. Extreme volatility         → "BUY blocked by gate G03: extreme volatility (83.2% ann.)"
-6. Down streak                → "BUY blocked by metarule M02: 3 consecutive down days (sustained selling pressure)"
-```
-
-#### `why_not_sell` — Why SELL was not triggered (NULL when signal = SELL)
-
-```
-"SELL not triggered: rating is 'Neutral' and no price anomaly"
-"SELL not triggered: price anomaly present but signal_score=1 is non-negative (anomaly SELL requires score < 0)"
-```
-
-#### `reasoning_trace` — Step-by-step inference trace (How)
-
-A numbered sequence showing every decision point:
-
-```
-1. CF engine: combined_cf=0.72 → BUY direction.
-2. Anomaly gate (G01): has_price_anomaly=false.
-3. Sector gate (G02): advance_ratio=62% [passed].
-4. Metarules: none.
-5. Final: BUY (Buy)
-```
-
-```
-1. CF engine: combined_cf=0.51 → BUY direction.
-2. Anomaly gate (G01): has_price_anomaly=false.
-3. Sector gate (G02): advance_ratio=43% [BLOCKED].
-4. Metarules: none.
-5. Final: HOLD
+              ┌──────────────────────────────────────────────┐
+              │          INPUT: 5 decision keys              │
+              │  rating, has_anomaly, sector_ok,             │
+              │  vol_level, at_52w_pos                       │
+              └──────────────────────┬───────────────────────┘
+                                     │
+                                     ▼
+              ┌──────────────────────────────────────────────┐
+              │   Find all matching rules in decision_table  │
+              │   (non-'any' conditions must equal input)    │
+              └──────────────────────┬───────────────────────┘
+                                     │
+                                     ▼
+              ┌──────────────────────────────────────────────┐
+              │   Compute specificity_score for each match   │
+              │   = count of non-'any' conditions            │
+              └──────────────────────┬───────────────────────┘
+                                     │
+                                     ▼
+              ┌──────────────────────────────────────────────┐
+              │   Select winner                              │
+              │   highest specificity_score first            │
+              │   tie → lowest state_id (gate beats diff.)  │
+              └──────────────────────┬───────────────────────┘
+                                     │
+                                     ▼
+              ┌──────────────────────────────────────────────┐
+              │   Output: signal, signal_cf, state_id        │
+              └──────────────────────────────────────────────┘
 ```
 
 ---
 
-## Part 3 — Case-Based Reasoning
+## Part 3 — Anomaly SELL Override
 
-### CBR Overview
+**Why this exists:** The decision table handles anomalies primarily as a **BUY
+blocker** — rows S03, S10, S17, S24, S31 produce HOLD or SELL when `has_anomaly=true`.
+However, the original system logic defines a specific SELL trigger that the table
+alone cannot express: a **Neutral-rated stock with a price anomaly and a negative
+signal_score** should produce a SELL, not a HOLD.
 
-The CBR system follows the 4 R's pattern:
+Row S17 (Neutral + anomaly) gives HOLD with CF=−0.20, which is conservative but
+technically correct for the anomaly-alone case. However, when the anomaly co-occurs
+with a negative score (signal_score < 0), the combination represents a genuine
+breakdown that warrants a SELL.
 
-| Step | Component | What it does |
+**The override rule:**
+
+```
+IF  has_price_anomaly = TRUE
+AND rating = 'Neutral'   (signal_score in range −2 to 0)
+AND signal_score < 0
+THEN  signal = SELL,  signal_cf = −0.50,  confidence = MEDIUM
+```
+
+**Why CF=−0.50?** This is a medium-conviction SELL. It is weaker than a Sell-rated
+stock with anomaly (S24, CF=−0.85) because the technical rating is Neutral, not
+confirmed Sell. But the combination of a negative score plus a price anomaly (an
+abnormal downward move) suggests a genuine breakdown, not noise. CF=−0.50 sits in
+the MEDIUM zone — strong enough to act on, not so strong as to be confused with a
+structurally bearish stock.
+
+**Example:** A stock with rating=Neutral (score=−2), vol=normal, no sector issues,
+but a 9% drop flagged as a price-IQR anomaly. The table would give HOLD (S17,
+CF=−0.20). The override fires → SELL, CF=−0.50, confidence=MEDIUM.
+
+---
+
+## Part 4 — How a Signal Is Formed: Step by Step
+
+The full inference for one `(symbol, date)` proceeds in five steps:
+
+**Step 1 — Gather gold layer outputs**
+
+The model joins all six gold tables on `(symbol, date)`. Gold models handle their
+own incremental computation; the decision model reads the result directly.
+
+**Step 2 — Classify continuous values into discrete decision keys**
+
+| Raw column | Decision key | Mapping |
 |---|---|---|
-| **Retrieve** | `decision_cbr_lookup` | Finds past cases with ≥ 3 matching feature bins |
-| **Reuse** | `decision_cbr_lookup` | Aggregates their outcomes (win rate, avg return) |
-| **Revise** | `decision_signals` | CF engine and metarules already adjust signals — CBR note is advisory |
-| **Retain** | `decision_case_outcomes` + Airflow DAG | Stores resolved outcomes as new cases |
+| `signal_score` | `rating` | ≥+5 → Strong Buy, ≥+3 → Buy, ≤−5 → Strong Sell, ≤−3 → Sell, else → Neutral |
+| `annualized_vol` | `vol_level` | >0.80 → extreme, >0.50 → high, >0.20 → normal, else → low |
+| `at_52w_high`, `at_52w_low` | `at_52w_pos` | at_low → near_low, at_high → near_high, else → neutral |
+| `sector_advance_ratio` | `sector_ok` | ≥ 0.50 → true, else → false |
+| `has_price_anomaly` | `has_anomaly` | as-is (boolean) |
 
-### Feature Binning (5 dimensions)
+**Step 3 — Look up the decision table (specificity-ordered)**
 
-Each case — past or current — is characterised by 5 categorical bins:
+Match all 36 rows against the five decision keys. Select the row with the highest
+`specificity_score`; break ties by lowest `state_id`. This row determines the initial
+`signal`, `signal_cf`, and `confidence`.
 
-| Dimension | Column | Bins |
+**Step 4 — Apply anomaly SELL override if condition is met**
+
+Check: `has_price_anomaly = TRUE AND rating = 'Neutral' AND signal_score < 0`.
+If true, override the table result with `SELL, CF=−0.50, MEDIUM`.
+
+**Step 5 — Assemble explanation columns and write output**
+
+Generate `why_signal`, `why_not_buy`, `why_not_sell`, `reasoning_trace` from the
+matched state and the actual condition values. Write one row per `(symbol, date)`.
+
+---
+
+## Part 5 — Realistic End-to-End Examples
+
+### Example A: Strong Buy + Near 52-Week Low → BUY (CF=0.92)
+
+**Propose:** Strong Buy (score=+6)
+**Protect:** No anomaly, vol=normal (25%) → all gates pass
+**Validate:** sector_ok=true (65% advancing), at_52w_pos=near_low (1.5% above 52W low)
+
+| Step | Action | Result |
 |---|---|---|
-| Volatility | `annualized_vol` | very_low (<20%) / low (<35%) / medium (<50%) / high (<70%) / very_high |
-| RSI | `rsi14` | oversold (<30) / neutral / overbought (>70) |
-| 52W position | `pct_from_high` | near_low (<−50%) / mid_low / mid / mid_high / near_high (>−5%) |
-| Sector momentum | `sector_advance_ratio` | bearish (<40%) / neutral / bullish (>60%) |
-| Technical score | `signal_score` | strong_sell / sell / neutral / buy / strong_buy |
+| 1 | Classify inputs | rating=Strong Buy, vol=normal, 52W=near_low, anomaly=false, sector_ok=true |
+| 2 | Match decision table | S05 matches (specificity=4); S07 also matches (specificity=3) → S05 wins |
+| 3 | Read rule | S05: BUY, CF=+0.92, HIGH |
+| 4 | Override check | Not triggered |
+| 5 | Output | BUY, CF=+0.92, HIGH, state_id=S05 |
 
-Cases with **≥ 3 matching bins** are considered similar. The lookup aggregates their outcomes:
+```
+signal = BUY   signal_cf = 0.92   confidence = HIGH   state_id = S05
 
-- `similar_cases_count` — number of similar historical cases found
-- `cbr_win_rate` — fraction of similar cases where the signal led to a WIN
-- `cbr_avg_return_5d` — average 5-day forward return in similar cases
-- `cbr_note` — plain-English summary, e.g. `"Based on 12 similar past cases: 75% win rate, avg 5d return=+2.3%"`
+why_signal:
+  "BUY (CF=0.92, HIGH): state=S05 — Best setup: strong technicals +
+   clean conditions + near 52W low (mean reversion)"
 
-### Outcome Definition
+why_not_buy: NULL   (signal IS buy)
 
-The Airflow DAG `decision_cbr_outcomes` runs daily, looks up forward prices 5 and 20 trading days after each signal, and computes:
-
-$$\text{return}_{5d} = \frac{\text{close}_{t+5} - \text{close}_t}{\text{close}_t}$$
-
-| Signal | WIN condition |
-|---|---|
-| BUY | return_5d > 0% |
-| SELL | return_5d < 0% |
-| HOLD | \|return_5d\| ≤ 1% |
+reasoning_trace:
+  "1. Inputs classified: rating=Strong Buy, score=6/8, vol=normal,
+   52W=near_low, anomaly=false, sector_ok=true.
+   2. Decision table matched: state=S05 (specificity=4).
+   3. Signal=BUY, CF=0.92 (HIGH)."
+```
 
 ---
 
-## Part 4 — Validation
+### Example B: Buy Rating Blocked by High Volatility → HOLD (CF=0.18)
 
-`decision_validation` reports these metrics per month, signal type, and sector:
+**Propose:** Buy (score=+3)
+**Protect:** vol=high (62% annualised) → **volatility gate fires**, blocks full BUY
+**Validate:** sector_ok=true, 52W=neutral — but protect already won
 
-| Metric | Definition |
-|---|---|
-| **Accuracy** | Fraction of signals where outcome = WIN |
-| **Reliability** | Same as accuracy (fraction of predictions empirically correct) |
-| **avg_return_5d** | Average 5-day forward return across all signals of this type |
-| **stddev_return_5d** | Standard deviation of 5-day returns (risk measure) |
-| **Sensitivity** | Count of signals where \|combined_cf\| is between 0.35–0.45 (near the decision boundary — would flip if the threshold moved slightly) |
+| Step | Action | Result |
+|---|---|---|
+| 1 | Classify inputs | rating=Buy, vol=high, 52W=neutral, anomaly=false, sector_ok=true |
+| 2 | Match decision table | S08 (vol=high, spec=4) and S14 (default, spec=3) both match → S08 wins |
+| 3 | Read rule | S08: HOLD, CF=+0.18, LOW |
+| 4 | Override check | Not triggered (no anomaly) |
+| 5 | Output | HOLD, CF=+0.18, LOW, state_id=S08 |
 
-This table is empty until `decision_case_outcomes` is populated by the Airflow CBR DAG (requires 5+ trading days of history).
+```
+signal = HOLD   signal_cf = 0.18   confidence = LOW   state_id = S08
+
+why_signal:
+  "HOLD (CF=0.18, LOW): state=S08 — High volatility (62% ann.) blocks BUY —
+   position sizing unsafe, but technicals are positive."
+
+why_not_buy:
+  "high volatility (62.4% ann.) — position risk"
+
+reasoning_trace:
+  "1. Inputs: rating=Buy, score=3/8, vol=high, 52W=neutral,
+   anomaly=false, sector_ok=true.
+   2. Decision table matched: state=S08 (high vol gate, spec=4).
+   3. Signal=HOLD, CF=0.18 (LOW)."
+```
 
 ---
 
-## Output Columns
+### Example C: Neutral + Price Anomaly + Negative Score → SELL Override (CF=−0.50)
 
-### `decision_signals`
+**Propose:** Neutral (score=−2) — no strong directional bias
+**Protect:** has_price_anomaly=true → table gives HOLD (S17, CF=−0.20)
+**Override condition met:** Neutral + anomaly + negative score → SELL
+
+| Step | Action | Result |
+|---|---|---|
+| 1 | Classify inputs | rating=Neutral, score=−2, vol=normal, anomaly=true, sector_ok=false |
+| 2 | Match decision table | S17 (anomaly, spec=2) → HOLD, CF=−0.20 |
+| 3 | Check override | Neutral AND anomaly AND score < 0 → TRUE |
+| 4 | Apply override | SELL, CF=−0.50, MEDIUM, state_id=NULL |
+| 5 | Output | SELL, CF=−0.50, MEDIUM |
+
+```
+signal = SELL   signal_cf = -0.50   confidence = MEDIUM   state_id = NULL
+
+why_signal:
+  "SELL (CF=-0.50, MEDIUM): Anomaly SELL override — Neutral rating with
+   negative score (−2/8) + price anomaly = breakdown confirmation"
+
+why_not_buy:
+  "Rating is 'Neutral' (score=-2/8) — not eligible for BUY; price anomaly detected"
+
+reasoning_trace:
+  "1. Inputs: rating=Neutral, score=-2/8, vol=normal, 52W=neutral,
+   anomaly=true, sector_ok=false.
+   2. Decision table matched: state=S17 (anomaly gate) → HOLD, CF=-0.20.
+   3. Anomaly SELL override condition met → final Signal=SELL, CF=-0.50 (MEDIUM).
+   [anomaly SELL override applied]"
+```
+
+---
+
+## Part 6 — Explanation Facility (XAI)
+
+The system implements explainable AI (XAI) as defined in Lecture 4 §4.8–4.9: every
+output row carries human-readable fields that trace the decision from input to output.
+A reviewer can understand any signal without reading SQL.
+
+### `why_signal` — Dynamic Justification
+
+A template-based string explaining why the **specific** signal was chosen. It always
+references the matched rule (`state_id`) or override condition.
+
+| Scenario | Example |
+|---|---|
+| S05 (Strong Buy + near_low) | `"BUY (CF=0.92, HIGH): state=S05 — Best setup: strong technicals + clean conditions + near 52W low"` |
+| S08 (Buy + high vol) | `"HOLD (CF=0.18, LOW): state=S08 — High volatility (62% ann.) blocks BUY"` |
+| S24 (Sell + anomaly) | `"SELL (CF=-0.85, HIGH): state=S24 — Sell rating + price anomaly = compounded bearish"` |
+| Override | `"SELL (CF=-0.50, MEDIUM): Anomaly SELL override — breakdown confirmation"` |
+
+### `why_not_buy` — Tracing the Blocker (NULL when signal = BUY)
+
+Reports the **first blocking condition** in protect-before-validate order:
+
+1. Rating not eligible (Neutral, Sell, Strong Sell)
+2. Price anomaly detected
+3. Sector advancing < 50%
+4. High or extreme volatility
+5. Otherwise: decision table state
+
+This ordering reflects the conceptual model: protect conditions are reported before
+validate conditions, matching the priority in which they fire.
+
+### `why_not_sell` — NULL when signal = SELL
+
+```
+"Rating is 'Buy' and no triggering anomaly"
+"SELL not triggered: rating is 'Neutral' and no triggering anomaly"
+```
+
+### `reasoning_trace` — Numbered How-Trace (§4.9 Tracing)
+
+A numbered sequence showing every inference step from input classification to final
+signal. Step 1 shows classified inputs; Step 2 shows the matched rule; Step 3 shows
+the final output; override is noted when applied.
+
+These four fields together satisfy all four explanation types from §4.8:
+- **Why** → `why_signal`
+- **Why Not** → `why_not_buy`, `why_not_sell`
+- **How** → `reasoning_trace`
+- **Journalistic** → the compact `explanation` string (who/what/when/why)
+
+---
+
+## Part 7 — Output Columns Reference
 
 | Column | Type | Description |
 |---|---|---|
@@ -393,203 +860,120 @@ This table is empty until `decision_case_outcomes` is populated by the Airflow C
 | `date` | DATE | Trading date |
 | `close` | DOUBLE | Closing price (SAR) |
 | `signal` | VARCHAR | **BUY / SELL / HOLD** |
-| `confidence` | VARCHAR | **HIGH / MEDIUM / LOW** (from CF combination) |
-| `explanation` | VARCHAR | Backward-compatible summary string |
-| `why_signal` | VARCHAR | Why this signal was generated |
-| `why_not_buy` | VARCHAR | Which gate blocked BUY (NULL if signal = BUY) |
-| `why_not_sell` | VARCHAR | Why SELL was not triggered (NULL if signal = SELL) |
+| `signal_cf` | DOUBLE | Certainty factor −1.0 to +1.0 (§4.10) |
+| `confidence` | VARCHAR | **HIGH** (≥0.65) / **MEDIUM** (≥0.40) / **LOW** (<0.40) |
+| `state_id` | VARCHAR | Matched decision table row (e.g. `S05`); NULL on override |
+| `why_signal` | VARCHAR | Dynamic explanation of this signal |
+| `why_not_buy` | VARCHAR | First blocking condition — NULL when signal = BUY |
+| `why_not_sell` | VARCHAR | Why SELL not triggered — NULL when signal = SELL |
 | `reasoning_trace` | VARCHAR | Numbered step-by-step inference trace |
-| `combined_cf` | DOUBLE | Combined certainty factor (−1.0 to +1.0) |
-| `cf_confidence` | VARCHAR | HIGH / MEDIUM / LOW from CF formula |
-| `cf_buy_strength` | DOUBLE | combined_cf when ≥ 0.40, else 0 |
-| `cf_sell_strength` | DOUBLE | \|combined_cf\| when ≤ −0.40, else 0 |
-| `active_metarules` | VARCHAR | Space-separated fired metarule IDs |
-| `required_score_for_buy` | INT | 3 normally; 6 when M01 fires |
-| `signal_score` | INT | −8 to +8 net technical vote |
+| `rating` | VARCHAR | Strong Buy / Buy / Neutral / Sell / Strong Sell |
+| `signal_score` | INT | −8 to +8 net indicator vote |
 | `buy_signals` | INT | Count of buy votes (0–8) |
 | `sell_signals` | INT | Count of sell votes (0–8) |
-| `rating` | VARCHAR | Strong Buy / Buy / Neutral / Sell / Strong Sell |
 | `rsi14` | DOUBLE | 14-day RSI |
-| `sma50` / `sma200` | DOUBLE | Simple moving averages |
-| `bb_lower` / `bb_upper` | DOUBLE | Bollinger Band boundaries |
+| `sma50` / `sma200` | DOUBLE | 50-day and 200-day SMAs |
+| `bb_lower` / `bb_upper` | DOUBLE | Bollinger Band boundaries (SMA20 ± 2σ) |
+| `annualized_vol` | DOUBLE | 20-day volatility × √252 |
+| `vol_level` | VARCHAR | low / normal / high / extreme |
 | `high_52w` / `low_52w` | DOUBLE | 52-week high and low |
-| `pct_from_high` | DOUBLE | % below 52-week high (negative) |
-| `pct_from_low` | DOUBLE | % above 52-week low (positive) |
-| `at_52w_high` | BOOLEAN | Within 2% of 52-week high |
-| `at_52w_low` | BOOLEAN | Within 2% of 52-week low |
-| `annualized_vol` | DOUBLE | 20-day vol × √252 |
-| `has_price_anomaly` | BOOLEAN | IQR outlier on daily return |
-| `has_volume_anomaly` | BOOLEAN | Z-score > 2.5 on volume |
+| `pct_from_high` / `pct_from_low` | DOUBLE | % distance from 52-week extremes |
+| `at_52w_high` / `at_52w_low` | BOOLEAN | Within 2% of 52-week extreme |
+| `at_52w_pos` | VARCHAR | near\_low / neutral / near\_high |
+| `has_price_anomaly` | BOOLEAN | IQR outlier on daily log-return |
+| `has_volume_anomaly` | BOOLEAN | Z-score > 2.5 on daily volume |
 | `sector_advance_ratio` | DOUBLE | Fraction of sector advancing (0–1) |
+| `sector_ok` | BOOLEAN | sector\_advance\_ratio ≥ 0.50 |
+| `session_vwap` | DOUBLE | Intraday VWAP from tick stream (NULL if no ticks) |
 
 ---
 
-## Example Output
-
-### Full row example — BUY signal
-
-```
-symbol:            2222
-company_name:      Saudi Aramco
-date:              2025-03-12
-close:             29.80
-signal:            BUY
-confidence:        HIGH
-combined_cf:       0.7900
-cf_confidence:     HIGH
-active_metarules:  (empty)
-required_score_for_buy: 3
-
-why_signal:
-  "BUY: Buy rating (CF=0.79, score=+5/8) + no price anomaly + sector advance=64%"
-
-why_not_sell:
-  "SELL not triggered: rating is 'Buy' and no price anomaly"
-
-reasoning_trace:
-  "1. CF engine: combined_cf=0.79 → BUY direction.
-   2. Anomaly gate (G01): has_price_anomaly=false.
-   3. Sector gate (G02): advance_ratio=64% [passed].
-   4. Metarules: none.
-   5. Final: BUY (Buy)"
-
-explanation:
-  "Rating: Buy (score=5/8, buy=6, sell=1); RSI(14)=26.4; near 52W low (+1.1% above);
-   sector advance=64%"
-```
-
-### Full row example — HOLD (gate blocked BUY)
-
-```
-symbol:            1010
-signal:            HOLD
-combined_cf:       0.5100
-cf_confidence:     MEDIUM
-active_metarules:  (empty)
-
-why_signal:
-  "HOLD: Buy rating (CF=0.51, score=+3/8) — insufficient conditions for BUY or SELL"
-
-why_not_buy:
-  "BUY blocked by gate G02: sector advance 43% < 50% threshold"
-
-why_not_sell:
-  "SELL not triggered: rating is 'Buy' and no price anomaly"
-
-reasoning_trace:
-  "1. CF engine: combined_cf=0.51 → BUY direction.
-   2. Anomaly gate (G01): has_price_anomaly=false.
-   3. Sector gate (G02): advance_ratio=43% [BLOCKED].
-   4. Metarules: none.
-   5. Final: HOLD"
-```
-
-### Full row example — SELL (metarule + anomaly)
-
-```
-symbol:            2010
-signal:            SELL
-active_metarules:  M01 G03
-required_score_for_buy: 6
-
-why_signal:
-  "SELL: price-IQR anomaly with negative signal score (-2)"
-
-why_not_buy:
-  "BUY not triggered: rating is 'Neutral' (score=-2/8, requires Buy or Strong Buy)"
-
-reasoning_trace:
-  "1. CF engine: combined_cf=-0.43 → SELL direction.
-   2. Anomaly gate (G01): has_price_anomaly=true.
-   3. Sector gate (G02): advance_ratio=31% [BLOCKED].
-   4. Metarules: M01 G03.
-   5. Final: SELL"
-```
-
----
-
-## Query Examples
+## Part 8 — Query Examples
 
 ```sql
--- Latest BUY signals with HIGH confidence
-SELECT symbol, company_name, sector, close, combined_cf, why_signal
+-- Today's BUY signals ranked by certainty
+SELECT symbol, company_name, sector, close, signal_cf, state_id, why_signal
 FROM iceberg.decision.decision_signals
 WHERE date = (SELECT MAX(date) FROM iceberg.decision.decision_signals)
   AND signal = 'BUY'
-  AND confidence = 'HIGH'
-ORDER BY combined_cf DESC;
+ORDER BY signal_cf DESC;
 
--- Why was each HOLD blocked from becoming a BUY?
-SELECT symbol, signal_score, combined_cf, why_not_buy, active_metarules
+-- Which decision table rule fired for each symbol today?
+SELECT symbol, rating, vol_level, at_52w_pos,
+       has_price_anomaly, sector_ok, state_id, signal, signal_cf
+FROM iceberg.decision.decision_signals
+WHERE date = (SELECT MAX(date) FROM iceberg.decision.decision_signals)
+ORDER BY signal_cf DESC;
+
+-- Buy/Strong Buy stocks that got blocked — which gate fired?
+SELECT symbol, rating, signal_score, vol_level, at_52w_pos,
+       has_price_anomaly, sector_ok, state_id, signal_cf, why_not_buy
 FROM iceberg.decision.decision_signals
 WHERE date = (SELECT MAX(date) FROM iceberg.decision.decision_signals)
   AND signal = 'HOLD'
   AND rating IN ('Buy', 'Strong Buy')
-ORDER BY combined_cf DESC;
+ORDER BY signal_cf DESC;
 
--- Full reasoning trace for a specific symbol
-SELECT date, signal, reasoning_trace, why_signal, why_not_buy
-FROM iceberg.decision.decision_signals
-WHERE symbol = '2222'
-ORDER BY date DESC
-LIMIT 10;
-
--- SELL signals near 52-week highs (potential breakdown)
-SELECT symbol, close, high_52w, pct_from_high, why_signal, reasoning_trace
+-- Distribution of rules fired today — which states are most common?
+SELECT state_id, signal, confidence, COUNT(*) AS symbols_matched
 FROM iceberg.decision.decision_signals
 WHERE date = (SELECT MAX(date) FROM iceberg.decision.decision_signals)
-  AND signal = 'SELL'
-  AND at_52w_high = TRUE;
+GROUP BY state_id, signal, confidence
+ORDER BY symbols_matched DESC;
 
--- Check which metarules are firing today
-SELECT date, active_metarules, COUNT(*) AS symbols_affected
-FROM iceberg.decision.decision_metarule_flags
-WHERE date = (SELECT MAX(date) FROM iceberg.decision.decision_metarule_flags)
-  AND active_metarules != ''
-GROUP BY date, active_metarules
-ORDER BY symbols_affected DESC;
-
--- CBR: BUY signals with strong historical backing
-SELECT s.symbol, s.close, s.why_signal, c.cbr_win_rate, c.cbr_avg_return_5d, c.cbr_note
-FROM iceberg.decision.decision_signals s
-JOIN iceberg.decision.decision_cbr_lookup c ON s.symbol = c.symbol AND s.date = c.date
-WHERE s.date = (SELECT MAX(date) FROM iceberg.decision.decision_signals)
-  AND s.signal = 'BUY'
-  AND c.cbr_win_rate >= 0.65
-ORDER BY c.cbr_win_rate DESC;
-
--- Validation: monthly accuracy by signal type
-SELECT month, signal, total_signals, accuracy, reliability,
-       avg_return_5d, threshold_sensitive_count
-FROM iceberg.decision.decision_validation
-ORDER BY month DESC, signal;
-
--- Knowledge Base: inspect all active rules
-SELECT rule_id, rule_name, category, certainty_factor, condition_description
-FROM iceberg.decision.knowledge_rules
-WHERE is_active = TRUE
-ORDER BY category, rule_id;
+-- Full history for a specific symbol — what changed over time?
+SELECT date, signal, state_id, signal_cf, confidence, reasoning_trace
+FROM iceberg.decision.decision_signals
+WHERE symbol = '2222'
+ORDER BY date DESC LIMIT 30;
 ```
 
 ---
 
-## Updating the Knowledge Base
+## Part 9 — Maintaining the Knowledge Base
 
-To add, modify, or deactivate a rule:
+To change a signal, adjust a CF value, or add a new rule:
 
-1. Edit `dbt/seeds/knowledge_rules.csv` — change a certainty factor, add a row, or set `is_active=false`.
-2. Run: `docker exec dbt dbt seed --select knowledge_rules --project-dir /usr/dbt --profiles-dir /root/.dbt`
-3. Re-run the decision layer: `docker exec dbt dbt run --select decision_cf_engine+ --project-dir /usr/dbt --profiles-dir /root/.dbt`
+1. **Edit** `dbt/seeds/decision_table.csv`
+2. **Run:**
+```bash
+docker exec dbt dbt seed --select decision_table --project-dir /usr/dbt --profiles-dir /root/.dbt
+docker exec dbt dbt run  --select decision_signals  --project-dir /usr/dbt --profiles-dir /root/.dbt
+```
 
-The `+` selector propagates changes downstream through `decision_signals`, `decision_cbr_lookup`, and `decision_validation` automatically.
+No SQL knowledge required. The domain expert edits the CSV only.
+
+**CF assignment guide:**
+
+| Scenario | Recommended `signal_cf` |
+|---|---|
+| Perfect BUY: strong rating + low vol + near 52W low | +0.90 to +0.95 |
+| Standard BUY: good conditions, neutral 52W position | +0.70 to +0.88 |
+| Moderate BUY: near resistance or slightly elevated vol | +0.50 to +0.65 |
+| BUY blocked but positive technical lean | +0.10 to +0.28 |
+| Gate fires, CF turns slightly negative | −0.10 to −0.30 |
+| Standard SELL | −0.68 to −0.75 |
+| SELL with potential support (near 52W low) | −0.50 to −0.60 |
+| SELL confirmed by anomaly or sector decline | −0.80 to −0.88 |
+| Maximum SELL: Strong Sell + anomaly | −0.90 to −0.95 |
+
+**Adding a new rule:** Add a row with a new `state_id` (S37+) and set
+`specificity_score` to the count of non-`any` conditions. State IDs S01–S36 are
+reserved — new rows with higher IDs will have lower priority than existing rows of
+equal specificity.
 
 ---
 
-## Important Limitations
+## Limitations & Caveats
 
 - **Not financial advice.** Signals are generated by deterministic SQL rules on historical prices. They do not account for fundamentals, news, earnings, or geopolitical events.
-- **Shallow knowledge.** The system uses IF-THEN rules (shallow knowledge). It has no causal model of *why* prices move. Deep knowledge — economic causality, sector dynamics, earnings cycles — is outside the current scope.
-- **Simulation data.** Outside Tadawul market hours (Sun–Thu 10:00–15:00 Riyadh time), the producer generates random-walk ticks. Signals derived from simulated data are for pipeline testing only.
-- **CBR requires history.** `decision_cbr_lookup` and `decision_validation` return empty or near-empty results until the Airflow CBR DAG has run for several weeks to accumulate outcomes.
-- **Yahoo Finance coverage.** The batch pipeline relies on yfinance (`.SR` suffix). Data quality varies by symbol, especially for smaller-cap stocks and dates before 2018.
-- **No look-ahead bias.** All indicators use only information available at market close on the signal date.
+
+- **Shallow knowledge (§6.6).** The system encodes empirical price patterns using IF-THEN rules. It has no causal model of *why* prices move. Deep knowledge — sector dynamics, macroeconomic causality, earnings cycles — is outside the current scope.
+
+- **Simulation data.** Outside Tadawul market hours (Sun–Thu 10:00–15:00 Riyadh time), the Kafka producer generates random-walk ticks. Signals derived from simulated ticks are for pipeline testing only.
+
+- **VWAP gaps.** `session_vwap` is NULL for days with no intraday tick data (batch-only historical loads).
+
+- **CBR requires accumulated history.** `decision_validation` returns empty or sparse results until the Airflow CBR DAG has run for several weeks to accumulate WIN/LOSS outcomes in `decision_case_outcomes`.
+
+- **No look-ahead bias.** All indicators use only information available at market close on the signal date. The system is designed for real-time deployment without data leakage.

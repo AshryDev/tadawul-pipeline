@@ -33,7 +33,15 @@
       "Bash(cp /Users/ahmedashry/.claude/image-cache/dc502b9b-97f3-4d51-9bc0-c039ddd67c81/4.png /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/figures/fig4_cf_number_line.png)",
       "Bash(cp /Users/ahmedashry/.claude/image-cache/dc502b9b-97f3-4d51-9bc0-c039ddd67c81/5.png /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/figures/fig5_dikw_medallion.png)",
       "Bash(cp /Users/ahmedashry/.claude/image-cache/dc502b9b-97f3-4d51-9bc0-c039ddd67c81/6.png /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/figures/fig6_kbs_architecture.png)",
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "Read(//Users/ahmedashry/Documents/**)",
+      "Read(//Users/ahmedashry/Desktop/**)",
+      "Read(//Users/ahmedashry/Downloads/**)",
+      "Bash(pip3 install *)",
+      "Bash(sed -i '' 's/knowledge_rules\\\\.csv'\\\\'': 13 named rules with CFs, categories, source references/decision_table.csv: 36 production rules with pre-assigned CFs/g' 's/`decision_cf_engine` \\(CF combination\\) + `decision_metarule_flags` \\(metarule evaluation\\) — distinct, separate models/`decision_signals` — single unified model \\(Propose → Protect → Validate\\)/g' /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/project_report.md)",
+      "Bash(sed -i '' 's/edits `knowledge_rules.csv`/edits `decision_table.csv`/g' 's/`knowledge_rules.csv`/`decision_table.csv`/g' /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/project_report.md)",
+      "Bash(sed -i '' 's/`decision_cf_engine` — CF combination formula/`decision_signals` + `decision_table.csv` — pre-assigned CF in each rule/g' 's/M01, M02, G03 in `decision_metarule_flags`/M01\\\\/M02\\\\/G03 encoded as Protect rows \\(S01–S03, S08–S10, etc.\\) in `decision_table.csv`/g' 's/rule_id.*knowledge_rules/state_id in `decision_table`/g' /Users/ahmedashry/Documents/GitHub/tadawul-pipeline/docs/project_report.md)",
+      "Bash(unzip -p Tadawul_KBS_Editorial.pptx 'ppt/slides/slide*.xml')"
     ]
   }
 }

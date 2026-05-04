@@ -1,58 +1,72 @@
 version: 2
 
 seeds:
-  - name: knowledge_rules
-    description: >
-      Named Knowledge Base for the Tadawul KBS decision layer (Lecture 4 §4.1–4.2,
-      Lecture 6 §6.9). Each row is a named rule — inference rule, knowledge gate,
-      or metarule — with an associated certainty factor (Lecture 4 §4.10).
-
-      This CSV is the Knowledge Acquisition interface (Lecture 7 §7.4 KA module).
-      Domain experts can add, modify, or deactivate rules by editing this file and
-      running: dbt seed --select knowledge_rules
-    columns:
-      - name: rule_id
-        description: "Unique rule identifier (R01–R08 inference, G01–G03 gates, M01–M02 metarules)."
-        tests: [not_null, unique]
-      - name: rule_name
-        description: "Short snake_case name for the rule."
-        tests: [not_null]
-      - name: category
-        description: "Rule category: inference | knowledge | metarule."
-        tests:
-          - not_null
-          - accepted_values:
-              values: ["inference", "knowledge", "metarule"]
-      - name: indicator_column
-        description: "The gold_technical_rating column or derived metric this rule operates on."
-        tests: [not_null]
-      - name: vote_direction
-        description: "What the rule asserts: BUY | BLOCK_BUY | TIGHTEN_BUY | SELL."
-        tests:
-          - not_null
-          - accepted_values:
-              values: ["BUY", "SELL", "BLOCK_BUY", "TIGHTEN_BUY"]
-      - name: certainty_factor
-        description: "Belief strength for this rule (0.0–1.0). Used in CF combination formula (§4.10)."
-        tests: [not_null]
-      - name: is_active
-        description: "Set to false to deactivate a rule without removing it from the KB."
-        tests: [not_null]
-      - name: source_reference
-        description: "Academic or domain source that justifies the rule."
-
   - name: decision_table
     description: >
-      Exhaustive decision table (Lecture 4 §4.7) mapping all reachable input
-      combinations to expected output signals. Used to verify the decision_signals
-      model handles every case correctly and to document the complete rule space.
+      The explicit Knowledge Base for the Tadawul KBS (Lecture 4 §4.7 Formal Logic).
+
+      Each row is a named production rule (§4.1) mapping a combination of market
+      conditions to a BUY / SELL / HOLD signal with a pre-assigned certainty factor
+      (§4.10) on a −1.0 to +1.0 scale.
+
+      At runtime, decision_signals classifies each (symbol, date) into a single
+      condition_group (the row dimension) and joins on (condition_group, rating_group)
+      — an exact 2-key match with no wildcards or specificity scoring required.
+
+      The 7 × 5 grid (35 states) is exhaustive and mutually exclusive by construction:
+        Rows (condition_group, priority order):
+          anomaly_highvol  (anomaly OR vol in {high,extreme} — Protect)
+          sector_weak      (advance ratio < 50% — Validate)
+          near_52w_low     (within 2% of 52W low — Validate)
+          near_52w_high    (within 2% of 52W high — Validate)
+          sector_ok_lowvol (sector ok + vol = low — base case)
+          mid_medvol       (sector ok + vol = normal — base case)
+          fallback         (residual unclassified context)
+        Cols (rating_group): Strong Buy | Buy | Neutral | Sell | Strong Sell
+        State IDs follow scenario-first ordering: S01-S05 = anomaly_highvol,
+        S06-S10 = sector_weak, S11-S15 = sector_ok_lowvol, S16-S20 = near_52w_low,
+        S21-S25 = near_52w_high, S26-S30 = mid_medvol, S31-S35 = fallback.
+
+      Knowledge Acquisition interface (§6.9, §7.4):
+        1. Edit this CSV — change signal_cf values or update signals.
+        2. docker exec dbt dbt seed --select decision_table
+        3. docker exec dbt dbt run  --select decision_signals
+        No SQL knowledge required.
     columns:
       - name: state_id
-        description: "Unique state identifier."
+        description: "Unique row identifier (S01–S35). Scenario-first ordering: S01–S05 = anomaly_highvol, S06–S10 = sector_weak, S11–S15 = sector_ok_lowvol, S16–S20 = near_52w_low, S21–S25 = near_52w_high, S26–S30 = mid_medvol, S31–S35 = fallback."
         tests: [not_null, unique]
-      - name: expected_signal
-        description: "The signal this combination should produce."
+      - name: condition_group
+        description: >
+          Row dimension — mutually exclusive market context, evaluated in priority order:
+          anomaly_highvol (price anomaly OR vol in {high,extreme} — Protect),
+          sector_weak (advance ratio < 50% — Validate),
+          near_52w_low (within 2% of 52W low — Validate),
+          near_52w_high (within 2% of 52W high — Validate),
+          sector_ok_lowvol (sector ok + vol = low),
+          mid_medvol (sector ok + vol = normal),
+          fallback (residual).
+        tests: [not_null]
+      - name: rating_group
+        description: "Column dimension — technical rating: Strong Buy / Buy / Neutral / Sell / Strong Sell."
+        tests: [not_null]
+      - name: signal
+        description: "Output signal for this rule: BUY / SELL / HOLD."
         tests:
           - not_null
           - accepted_values:
               values: ["BUY", "SELL", "HOLD"]
+      - name: signal_cf
+        description: >
+          Certainty factor (§4.10) for this rule — numeric scale −1.0 to +1.0.
+          Positive = BUY conviction. Negative = SELL conviction. Near zero = HOLD.
+        tests: [not_null]
+      - name: confidence
+        description: "Tier derived from |signal_cf|: HIGH (≥0.65) / MEDIUM (≥0.40) / LOW (<0.40)."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["HIGH", "MEDIUM", "LOW"]
+      - name: description
+        description: "Plain-English explanation of why this rule produces this signal."
+        tests: [not_null]

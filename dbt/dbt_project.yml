@@ -23,12 +23,10 @@ on-run-start:
 seeds:
   lakehouse:
     +schema: decision
-    knowledge_rules:
-      +column_types:
-        certainty_factor: double
-        is_active: boolean
     decision_table:
-      +column_types: {}
+      +column_types:
+        signal_cf: double
+        specificity_score: integer
 
 models:
   lakehouse:

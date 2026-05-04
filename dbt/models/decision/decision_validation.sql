@@ -14,7 +14,7 @@
   Measures reported (§4.12):
     Accuracy    — fraction of signals where outcome = WIN
     Reliability — fraction of predictions empirically correct (= accuracy here)
-    Sensitivity — count of signals near the decision boundary (|combined_cf| 0.35–0.45)
+    Sensitivity — count of signals near the decision boundary (|signal_cf| 0.35–0.45)
                   i.e. signals that would flip if the threshold moved slightly
 
   Requires decision_case_outcomes to be populated by the Airflow CBR DAG.
@@ -29,7 +29,7 @@ WITH outcomes AS (
         o.return_5d,
         o.return_20d,
         o.outcome,
-        s.combined_cf,
+        s.signal_cf,
         s.signal_score,
         s.sector
     FROM {{ ref('decision_case_outcomes') }} AS o
@@ -64,7 +64,7 @@ SELECT
     ROUND(STDDEV(return_5d), 4)                              AS stddev_return_5d,
 
     -- §4.12 Sensitivity: signals near the CF decision boundary (would flip with slight threshold change)
-    SUM(CASE WHEN ABS(combined_cf) BETWEEN 0.35 AND 0.45 THEN 1 ELSE 0 END)
+    SUM(CASE WHEN ABS(signal_cf) BETWEEN 0.35 AND 0.45 THEN 1 ELSE 0 END)
                                                              AS threshold_sensitive_count,
 
     -- §4.12 Breadth/Depth: sector-level accuracy spread
